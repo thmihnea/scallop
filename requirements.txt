@@ -1,0 +1,20 @@
+# Core runtime for the torch branch (Python 3.11).
+# transferable-samplers declares no runtime dependencies in its package metadata.
+# These are the dependencies of iF2D2 and the upstream leaf modules it imports.
+torch==2.10.0
+numpy==2.2.6
+scipy==1.15.3
+ml-collections==1.1.0
+tqdm==4.67.1
+wandb==0.23.1
+matplotlib==3.10.8
+openmm==8.4.0.post2
+mdtraj==1.10.3
+POT==0.9.6.post1
+deeptime==0.4.5
+scikit-learn==1.7.2
+huggingface-hub==1.2.3
+lightning-utilities==0.15.3
+transferable-samplers @ git+https://github.com/transferable-samplers/transferable-samplers.git@0728d47d64490228dc8ecccb0ffb577cea6636b3
+
+# Optional tests: python -m pip install pytest
