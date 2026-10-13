@@ -3,6 +3,8 @@
 [![Conference](https://img.shields.io/badge/NeurIPS-2026-purple)](#reference)
 [![arXiv](https://img.shields.io/badge/arXiv-2606.29110-b31b1b.svg)](https://arxiv.org/abs/2606.29110)
 
+[**Project page: SCALLOP — Few-Step Boltzmann Generators via Scalable Likelihood Flow Maps**](https://tonyauyeung.github.io/scallop/)
+
 This is the official codebase for [SCALLOP: Few-Step Boltzmann Generators via Scalable Likelihood Flow Maps](https://arxiv.org/pdf/2606.29110) (NeurIPS 2026).
 This repository provides a PyTorch implementation of SCALLOP for five peptide systems:
 `ace_a_nme`, `aaa`, `ace_aaa_nme`, `aaaaaa`, and `chignolin`:
