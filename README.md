@@ -95,7 +95,7 @@ python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
 
 ### Image experiments
 
-Codes and experiments for images are in <> (placeholder for scallop-image).
+Code and experiments for images are in [scallop-image](https://github.com/tonyauyeung/scallop-image.git).
 
 ## Acknowledgments ⚽️
 
