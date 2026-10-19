@@ -314,7 +314,7 @@ def test_readme_commands_resolve_without_launching(name, monkeypatch):
         args = eval_peptide_ts.parse_args(argv)
         assert args.mode == mode and args.eval_recipe == 'v1'
         assert args.steps == [{'ace_a_nme': 4, 'aaa': 4, 'ace_aaa_nme': 8,
-                               'aaaaaa': 16, 'chignolin': 32}[name]]
+                               'aaaaaa': 16, 'chignolin': 16}[name]]
         assert args.ckpt_path == f'<{mode}-checkpoint.pt>'
         assert args.out_dir == f'<run-dir>/eval/{mode}'
         assert args.ts_data_dir == 'datasets/ts' and args.batch_size == 1000
