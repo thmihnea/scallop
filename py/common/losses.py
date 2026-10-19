@@ -355,7 +355,8 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
     base = weighted_velocity + d_loss
     if cycle is not None:
-        base = base + cycle
+        cycle_v, cycle_d = cycle
+        base = base + cycle_v + cycle_d
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
@@ -364,6 +365,9 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         value = math.exp(-weight) * base + weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
+    if cycle is not None:
+        metrics[f"{family}/cycle_v_loss"] = cycle_v.detach()
+        metrics[f"{family}/cycle_div_loss"] = cycle_d.detach()
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -380,10 +384,9 @@ def _cycle_loss(net, s, t, x, u, d):
         t, s, x + _bcast(t - s, u) * u, train=False, return_div=True,
     ))
     v_loss = _sum_non_batch((u - back_u) ** 2)
-    d_loss = (torch.zeros_like(v_loss) if d is None
-              else _sum_non_batch((d - back_d) ** 2) / _get_div_loss_scaling(net))
-    metrics = {"lsd/cycle_v_loss": v_loss.detach(), "lsd/cycle_div_loss": d_loss.detach()}
-    return v_loss + d_loss, metrics
+    if d is None:
+        return v_loss, torch.zeros_like(v_loss)
+    return v_loss, _sum_non_batch((d - back_d) ** 2) / _get_div_loss_scaling(net)
 
 
 def lsd_term(
@@ -405,7 +408,7 @@ def lsd_term(
     primal, tangent = _raw_jvp(net, s, t, x)
     u, d = _split_div(primal)
     dt_u, dt_d = _split_div(tangent)
-    cycle, cycle_metrics = _cycle_loss(net, s, t, x, u, d) if cycle_loss else (None, {})
+    cycle = _cycle_loss(net, s, t, x, u, d) if cycle_loss else None
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
@@ -424,8 +427,7 @@ def lsd_term(
             target_d = g
         else:
             target_d = g - _bcast(t - s, d) * dt_d.detach()
-    value, metrics = _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
-    return value, {**metrics, **cycle_metrics}
+    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
 def psd_term(
