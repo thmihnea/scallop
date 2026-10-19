@@ -27,20 +27,19 @@ def test_cycle_adds_weighted_round_trip_values_and_gradients(density, vectorized
 
     kw = dict(interp=interp, stopgrad_type=stopgrad_type, density_ema_params=ema)
     base, _ = losses.lsd_term(net, teacher, x0, x1, None, s, t, **kw)
-    value, metrics = losses.lsd_term(net, teacher, x0, x1, None, s, t, cycle_weight=.7, **kw)
-    torch.testing.assert_close(value - base, .7 * expected)
+    value, metrics = losses.lsd_term(net, teacher, x0, x1, None, s, t, cycle_loss=True, **kw)
+    torch.testing.assert_close(value - base, expected)
     torch.testing.assert_close(metrics['lsd/cycle_v_loss'], cycle_v.detach())
     torch.testing.assert_close(metrics['lsd/cycle_div_loss'],
                                cycle_d.detach() if density else torch.zeros_like(cycle_v))
-    wanted = torch.autograd.grad((base + .7 * expected).sum(), (net.p, net.q), allow_unused=True)
+    wanted = torch.autograd.grad((base + expected).sum(), (net.p, net.q), allow_unused=True)
     got = torch.autograd.grad(value.sum(), (net.p, net.q), allow_unused=True)
     torch.testing.assert_close(got, wanted)
 
 
-@pytest.mark.parametrize('loss_type,cycle_weight', [('psd', 1.), ('lsd', -1.), ('lsd', float('nan'))])
-def test_setup_rejects_invalid_cycle_weight(loss_type, cycle_weight):
+def test_setup_rejects_cycle_loss_outside_lsd():
     cfg = SimpleNamespace(training=SimpleNamespace(
-        loss_type=loss_type, stopgrad_type='stopped', psd_type='uniform', cycle_weight=cycle_weight,
+        loss_type='psd', stopgrad_type='stopped', psd_type='uniform', cycle_loss=True,
     ))
-    with pytest.raises(ValueError, match='cycle_weight'):
+    with pytest.raises(ValueError, match='cycle_loss'):
         losses.setup_loss(cfg, PolynomialMap(), interpolant.setup_interpolant(build_problem_config()))
