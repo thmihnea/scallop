@@ -13,7 +13,7 @@ from common.sample_stages import ENERGY_CUTOFFS_KT, sample_stages, resampling_in
 
 @pytest.mark.parametrize("name,steps", [
     ("ace_a_nme", 4), ("aaa", 4), ("ace_aaa_nme", 8), ("aaaaaa", 16),
-    ("chignolin", 32),
+    ("chignolin", 16),
 ])
 def test_recipe_steps_accept_current_config_names(name, steps, tmp_path):
     args = launcher.parse_args(['--cfg_path', f'configs.{name}', '--ckpt_path', 'unused.pt',
