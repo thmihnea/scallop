@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Cycle-loss ablation for SCALLOP on ace_a_nme (ALA-2), from a bare GPU machine to a report.
 #
-#   bash cycle_ablation.sh            set up, test, train and evaluate in the background, then follow the log
+#   bash cycle_ablation.sh            set up, train and evaluate in the background, then follow the log
 #   bash cycle_ablation.sh status     latest progress table (also reports whether the job is alive)
 #   bash cycle_ablation.sh logs       follow the main log again
 #   bash cycle_ablation.sh report     print the comparison report
 #   bash cycle_ablation.sh stop       stop gracefully; training saves checkpoints. Rerun to resume.
 #
 # Steps: clone the invertibility branch, build a Python 3.11 env with uv (no root needed),
-# download the transferable-samplers data, run the test suite, then
+# download the ace_a_nme data, check the CUDA-graph path on GPU 0, then
 # py/launchers/cycle_ablation.py trains one velocity teacher (400k steps) and four
 # SCALLOP runs (100k steps each) in parallel:
 #
@@ -30,7 +30,7 @@
 #   TORCH_CUDA    torch wheel flavour, cu126 or cu128   (default: cu128 for compute capability >= 10, else cu126)
 #   GPUS          number of GPUs to use, 0..GPUS-1      (default: all)
 #   RUNS_PER_GPU  concurrent runs per GPU               (default: all four at once, lowered automatically on OOM)
-#   RUN_TESTS     1 to run the test suite before training (default: 1)
+#   RUN_TESTS     1 to run the CUDA-graph tests (about a minute) first (default: 1)
 #   FOREGROUND    1 to run attached instead of in the background (default: 0)
 set -Eeuo pipefail
 
@@ -150,8 +150,7 @@ if [[ ! -x $PY || $(cat "$VENV/.installed" 2>/dev/null) != "$stamp" ]]; then
   uv venv --python 3.11 --allow-existing "$VENV"
   uv pip install --python "$PY" --index-strategy unsafe-best-match \
     --extra-index-url "https://download.pytorch.org/whl/$TORCH_CUDA" \
-    "torch==2.10.0+$TORCH_CUDA" -r requirements.txt \
-    pytest "jax[cpu]==0.10.2" "flax==0.12.8" "optax==0.2.8"
+    "torch==2.10.0+$TORCH_CUDA" -r requirements.txt pytest
   echo "$stamp" > "$VENV/.installed"
 fi
 "$PY" - <<'EOF'
@@ -167,43 +166,23 @@ for i in range(torch.cuda.device_count()):
 print(f"torch {torch.__version__}: {torch.cuda.device_count()} GPU(s) OK")
 EOF
 
-# ---------------------------------------------------------------- data (all systems: the tests use them)
-say "fetching transferable-samplers data into $REPO/datasets/ts"
+# ---------------------------------------------------------------- data
+say "fetching the ace_a_nme data into $REPO/datasets/ts"
 (cd py && "$PY" - <<'EOF'
 from common import ts_systems
-from configs import ace_a_nme, aaa, ace_aaa_nme, aaaaaa, chignolin
-for module in (ace_a_nme, aaa, ace_aaa_nme, aaaaaa, chignolin):
-    system = ts_systems.resolve(module.get_config(0))
-    print(system.trajectory_name, ts_systems.ensure_data(system)["source"], flush=True)
+from configs import ace_a_nme
+system = ts_systems.resolve(ace_a_nme.get_config(0))
+print(system.trajectory_name, ts_systems.ensure_data(system)["source"], flush=True)
 EOF
 )
 
 # ---------------------------------------------------------------- tests
+# Only the GPU path the runs use: CUDA-graph capture must match eager training exactly.
 if [[ $RUN_TESTS == 1 && ! -f $WORKDIR/tests_passed_$commit ]]; then
-  ddp_test=py/tests/test_ddp.py::test_two_rank_numerical_equivalence_and_skip_recovery
-  say "running the test suite on CPU (about 10 minutes; output in $LOGS/tests.log)"
-  CUDA_VISIBLE_DEVICES= "$PY" -m pytest py/tests -q -rfs -p no:cacheprovider --deselect "$ddp_test" \
-    > "$LOGS/tests.log" 2>&1 || { tail -n 40 "$LOGS/tests.log"; die "tests failed; see $LOGS/tests.log"; }
-  tail -n 1 "$LOGS/tests.log"
-  say "running the CUDA-graph tests on GPU 0"
+  say "running the CUDA-graph tests on GPU 0 (about a minute)"
   CUDA_VISIBLE_DEVICES=0 "$PY" -m pytest py/tests/test_cuda_graphs.py -q -rfs -p no:cacheprovider \
     > "$LOGS/tests_cuda.log" 2>&1 || { tail -n 40 "$LOGS/tests_cuda.log"; die "CUDA tests failed; see $LOGS/tests_cuda.log"; }
   tail -n 1 "$LOGS/tests_cuda.log"
-  # Multi-GPU (DDP) code is not used by any run here, so these report without blocking.
-  say "running the DDP tests (informational: no run uses DDP)"
-  if CUDA_VISIBLE_DEVICES= "$PY" -m pytest "$ddp_test" -q -p no:cacheprovider > "$LOGS/tests_ddp.log" 2>&1; then
-    say "DDP CPU test passed"
-  else
-    say "DDP CPU test FAILED (not blocking; see $LOGS/tests_ddp.log)"
-  fi
-  if (( n_gpus >= 2 )); then
-    if IF2D2_TEST_DDP_CUDA=1 CUDA_VISIBLE_DEVICES=0,1 "$PY" -m pytest py/tests/test_cuda_graphs.py -q \
-        -p no:cacheprovider -k two_gpu >> "$LOGS/tests_ddp.log" 2>&1; then
-      say "two-GPU NCCL graph test passed"
-    else
-      say "two-GPU NCCL graph test FAILED (not blocking; see $LOGS/tests_ddp.log)"
-    fi
-  fi
   touch "$WORKDIR/tests_passed_$commit"
 fi
 

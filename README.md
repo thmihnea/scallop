@@ -96,7 +96,7 @@ python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
 ### Cycle-loss ablation
 
 `scripts/cycle_ablation.sh` runs the invertibility ablation on ace_a_nme from a bare GPU
-machine: it clones this branch, builds the environment, runs the tests, trains one velocity
+machine: it clones this branch, builds the environment, checks CUDA graphs, trains one velocity
 teacher and four SCALLOP runs (square or forward time pairs, each with and without
 `--cycle_loss`), then evaluates them with recipe v1 and a round-trip check and writes
 `report.md`. It runs in the background, resumes after interruptions and prints progress.
