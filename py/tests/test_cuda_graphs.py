@@ -94,17 +94,18 @@ class Pair:
                       for t in loss_args.sample_times(self.cfg, self.cpu_rng))
         return (x0, x1, None, *times)
 
+    def teachers(self, state):
+        """The configured (diag, offdiag) teachers, exactly as the training loop selects them."""
+        from launchers.learn import _select_teacher
+        return [_select_teacher(getattr(self.cfg.training, name), self.teacher,
+                                state.self_teacher(), state.ema_teacher())
+                for name in ('diag_teacher_source', 'offdiag_teacher_source')]
+
     def step(self, batch):
         values, flags = [], []
         for state, update, fn, gen in ((self.eager, self.eager_step, self.eager_loss, self.eager_rng),
                                         (self.graph, self.graph_step, self.graph_loss, self.graph_rng)):
-            from launchers.learn import _select_teacher
-            teachers = [
-                _select_teacher(getattr(self.cfg.training, name), self.teacher,
-                                state.self_teacher(), state.ema_teacher())
-                for name in ('diag_teacher_source', 'offdiag_teacher_source')
-            ]
-            value, metrics = update(state, fn, *teachers, batch, gen)
+            value, metrics = update(state, fn, *self.teachers(state), batch, gen)
             if state.last_update_succeeded:
                 state.update_ema()
             values.append(value)
@@ -185,8 +186,9 @@ def test_density_restore_validation_and_nonfinite_recovery(tmp_path):
     for state, update, fn, gen in ((pair.eager, pair.eager_step, pair.eager_loss, pair.eager_rng),
                                     (pair.graph, pair.graph_step, pair.graph_loss, pair.graph_rng)):
         before = deepcopy(state.state_dict())
+        # Same teachers as every other step: a teacher at new storage would rightly recapture.
         with pytest.raises(ValueError, match='diagonal times'):
-            update(state, fn, None, state.self_teacher(), tuple(bad), gen)
+            update(state, fn, *pair.teachers(state), tuple(bad), gen)
         assert_equal(before, state.state_dict())
     pair.step(batch)
     # NaN off-diagonal input bypasses the diagonal guard; finite-update policy skips it.

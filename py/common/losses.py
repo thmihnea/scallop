@@ -342,7 +342,7 @@ def _raw_jvp(net, s, t, x, velocity=None):
 
 
 def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
-                      *, conditional_density=False):
+                      *, conditional_density=False, cycle=None):
     v_loss = _sum_non_batch((u - target_u.detach()) ** 2)
     if d is None:
         _require_div_head(net, family)
@@ -354,6 +354,9 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         d_loss = _sum_non_batch((d - target_d.detach()) ** 2) / _get_div_loss_scaling(net)
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
     base = weighted_velocity + d_loss
+    if cycle is not None:
+        cycle_v, cycle_d = cycle
+        base = base + cycle_v + cycle_d
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
@@ -362,6 +365,9 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         value = math.exp(-weight) * base + weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
+    if cycle is not None:
+        metrics[f"{family}/cycle_v_loss"] = cycle_v.detach()
+        metrics[f"{family}/cycle_div_loss"] = cycle_d.detach()
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -372,9 +378,21 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     return value, metrics
 
 
+def _cycle_loss(net, s, t, x, u, d):
+    """Live round-trip residuals u(x,s,t) - u(X,t,s) and d(x,s,t) - d(X,t,s)."""
+    back_u, back_d = _split_div(net.calc_phi(
+        t, s, x + _bcast(t - s, u) * u, train=False, return_div=True,
+    ))
+    v_loss = _sum_non_batch((u - back_u) ** 2)
+    if d is None:
+        return v_loss, torch.zeros_like(v_loss)
+    return v_loss, _sum_non_batch((d - back_d) ** 2) / _get_div_loss_scaling(net)
+
+
 def lsd_term(
     net, teacher_params, x0, x1, label, s, t, *, interp,
     stopgrad_type="stopped", density_ema_params=None, eps=None, generator=None,
+    cycle_loss=False,
 ):
     """u + delta*partial_t u = sg(v_t(X_theta)); likewise for raw d.
 
@@ -382,12 +400,15 @@ def lsd_term(
     Velocity uses the explicitly selected teacher. Density uses its own EMA
     diagonal source at the detached CURRENT student endpoint. Divergence
     estimators and source conditional labels are never used at that endpoint.
+    ``cycle_loss`` adds the round-trip losses of :func:`_cycle_loss` inside
+    the learned weight.
     """
     _validate_stopgrad(stopgrad_type)
     x = interp.calc_It(s, x0, x1)
     primal, tangent = _raw_jvp(net, s, t, x)
     u, d = _split_div(primal)
     dt_u, dt_d = _split_div(tangent)
+    cycle = _cycle_loss(net, s, t, x, u, d) if cycle_loss else None
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
@@ -406,7 +427,7 @@ def lsd_term(
             target_d = g
         else:
             target_d = g - _bcast(t - s, d) * dt_d.detach()
-    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d)
+    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
 def psd_term(
@@ -571,6 +592,9 @@ def setup_loss(cfg, net, interp):
         if getattr(cfg.training, "diag_teacher_source", "conditional") != "conditional":
             raise ValueError("esd_imf requires conditional diagonal supervision")
     psd_type = getattr(cfg.training, "psd_type", None)
+    cycle_loss = getattr(cfg.training, "cycle_loss", False)
+    if cycle_loss and loss_type != "lsd":
+        raise ValueError("cycle_loss requires loss_type='lsd'")
     if getattr(net.config, "predict_divergence", False):
         if not math.isfinite(net.config.divergence_rescale) or net.config.divergence_rescale <= 0:
             raise ValueError("Density training requires a finite positive divergence_rescale")
@@ -599,7 +623,7 @@ def setup_loss(cfg, net, interp):
             return lsd_term(
                 net, teacher, x0, x1, label, s, t,
                 interp=interp, stopgrad_type=stopgrad_type,
-                density_ema_params=density_ema,
+                density_ema_params=density_ema, cycle_loss=cycle_loss,
             )
         elif loss_type in ESD_LOSS_TYPES:
             return esd_term(
