@@ -13,8 +13,9 @@ Each stage is the README command (velocity teacher, then ``--mode dlogpdt`` from
 that teacher) with only these flags added, so all four share the teacher, the
 seed and every recipe hyperparameter. Each run is evaluated with recipe v1 and
 eval_round_trip.py. Stages resume from their latest checkpoint after a crash, a
-stall or a rerun of this script. A short smoke pass at full batch size first
-checks the pipeline and picks how many runs fit on one GPU.
+stall or a rerun of this script. Runs that do not fit on a GPU together hit CUDA
+OOM; the orchestrator then lowers the runs per GPU and requeues them. ``--smoke``
+runs the whole pipeline with tiny budgets instead (for testing the tooling).
 
     python py/launchers/cycle_ablation.py run --root outputs/cycle_ablation
     python py/launchers/cycle_ablation.py status --root outputs/cycle_ablation
@@ -28,7 +29,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -221,6 +221,7 @@ class Scheduler:
         self.started = time.time()
         self.last_report = 0.0
         self.stop = None
+        self.per_gpu = 1
 
     def _gpus(self):
         return list(range(self.opts.n_gpus)) if self.opts.device == "cuda" else [None]
@@ -257,35 +258,44 @@ class Scheduler:
         except ProcessLookupError:
             pass
 
-    def _finish(self, job, code):
+    def _finish(self, job, code, jobs):
         job.proc = None
         if code == 0 and job.is_done():
             job.status = "done"
             log(f"{self.title}: {job.name} finished")
             return
         lines = tail(job.log_path, 40)
-        job.oom = any("out of memory" in line.lower() for line in lines)
+        job.oom = any("out of memory" in line.lower() or "alloc_failed" in line.lower() for line in lines)
         log(f"{self.title}: {job.name} exited with code {code}"
             + (" (CUDA out of memory)" if job.oom else "") + "; last log lines:\n    "
             + "\n    ".join(lines[-15:]))
+        if job.oom and self.per_gpu > 1:
+            # Too many runs share the GPU: not the run's fault, so this does not use an attempt.
+            sharing = sum(j is not job and j.status == "running" and j.gpu == job.gpu for j in jobs)
+            self.per_gpu = max(1, min(self.per_gpu - 1, sharing))
+            job.attempts -= 1
+            job.status = "pending"
+            log(f"{self.title}: lowering to {self.per_gpu} concurrent job(s) per GPU; "
+                f"{job.name} waits for a free slot and resumes from its latest checkpoint")
+            return
         job.status = "pending" if job.attempts < job.max_attempts else "failed"
         if job.status == "pending":
             log(f"{self.title}: will retry {job.name} (attempt {job.attempts + 1}/{job.max_attempts})")
 
     def run(self, jobs, per_gpu):
-        self.stop = None
+        self.stop, self.per_gpu = None, per_gpu
         handlers = {sig: signal.signal(sig, lambda s, f: setattr(self, "stop", s))
                     for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
-            return self._loop(jobs, per_gpu)
+            return self._loop(jobs)
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
 
-    def _loop(self, jobs, per_gpu):
+    def _loop(self, jobs):
         gpus = self._gpus()
         cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
-        threads = max(1, cpus // max(1, min(len(jobs), per_gpu * len(gpus))))
+        threads = max(1, cpus // max(1, min(len(jobs), self.per_gpu * len(gpus))))
         for job in jobs:
             if job.status == "pending" and job.is_done():
                 job.status = "done"
@@ -302,7 +312,7 @@ class Scheduler:
                     job.read_metrics()
                     code = job.proc.poll()
                     if code is not None:
-                        self._finish(job, code)
+                        self._finish(job, code, jobs)
                     else:
                         self._check_stall(job)
             for job in jobs:
@@ -310,7 +320,7 @@ class Scheduler:
                     continue
                 load = {g: sum(j.status == "running" and j.gpu == g for j in jobs) for g in gpus}
                 gpu = min(gpus, key=lambda g: load[g])
-                if load[gpu] >= per_gpu:
+                if load[gpu] >= self.per_gpu:
                     break
                 self._launch(job, gpu, threads)
             if time.time() - self.last_report >= (60 if time.time() - self.started < 900 else self.opts.progress_every):
@@ -510,6 +520,7 @@ class Pipeline:
         failed = self.scheduler.run(runs, per_gpu)
         manifest["runs"] = {job.name: {"resumed_at": job.resumes, "attempts": job.attempts,
                                        "status": job.status, "oom": job.oom} for job in runs}
+        manifest["runs_per_gpu"] = self.scheduler.per_gpu
         write_json(manifest_path, manifest)
         if failed:
             return failed
@@ -682,26 +693,6 @@ def write_report(root, smoke=False):
 # --------------------------------------------------------------------------- #
 # entry points
 # --------------------------------------------------------------------------- #
-def calibrate(opts, root):
-    """Run the smoke pipeline, lowering runs per GPU until four runs train without OOM."""
-    per_gpu = opts.runs_per_gpu or max(1, math.ceil(len(RUNS) / max(1, opts.n_gpus)))
-    while True:
-        smoke_root = os.path.join(root, "smoke")
-        pipeline = Pipeline(opts, smoke_root, smoke=True)
-        failed = pipeline.execute(per_gpu)
-        if not failed:
-            log(f"smoke: passed with {per_gpu} run(s) per GPU")
-            write_json(os.path.join(smoke_root, "passed.json"), {"runs_per_gpu": per_gpu})
-            return per_gpu
-        if per_gpu > 1 and any(job.oom for job in failed):
-            log(f"smoke: out of memory with {per_gpu} runs per GPU; retrying with {per_gpu - 1}")
-            shutil.rmtree(os.path.join(smoke_root, "runs"), ignore_errors=True)
-            per_gpu -= 1
-            continue
-        raise SystemExit(f"smoke test failed: {', '.join(job.name for job in failed)}; "
-                         f"see {os.path.join(smoke_root, 'logs')}")
-
-
 def command_run(opts):
     root = os.path.abspath(opts.root)
     os.makedirs(root, exist_ok=True)
@@ -714,15 +705,12 @@ def command_run(opts):
             raise SystemExit("No GPU found (nvidia-smi -L); pass --device cpu only for testing")
     else:
         opts.n_gpus = 1
-    smoke = read_json(os.path.join(root, "smoke", "passed.json"))
-    if not opts.skip_smoke and smoke is None:
-        smoke = {"runs_per_gpu": calibrate(opts, root)}
+    if opts.smoke:
+        root = os.path.join(root, "smoke")
     per_gpu = (opts.runs_per_gpu or read_json(os.path.join(root, "manifest.json"), {}).get("runs_per_gpu")
-               or (smoke or {}).get("runs_per_gpu") or max(1, math.ceil(len(RUNS) / opts.n_gpus)))
-    log(f"ablation: {len(RUNS)} runs, {opts.n_gpus} GPU(s), {per_gpu} run(s) per GPU")
-    if opts.smoke_only:
-        return
-    failed = Pipeline(opts, root, smoke=False).execute(per_gpu)
+               or max(1, math.ceil(len(RUNS) / opts.n_gpus)))
+    log(f"ablation: {len(RUNS)} runs, {opts.n_gpus} GPU(s), up to {per_gpu} run(s) per GPU")
+    failed = Pipeline(opts, root, smoke=opts.smoke).execute(per_gpu)
     if failed:
         raise SystemExit(f"failed: {', '.join(job.name for job in failed)}; see {os.path.join(root, 'logs')}")
     log(f"ablation complete: {os.path.join(root, 'report.md')}")
@@ -752,9 +740,9 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--n_gpus", type=int, default=0, help="GPUs to use, 0..n-1 (default: all)")
     p.add_argument("--runs_per_gpu", type=int, default=0,
-                   help="concurrent runs per GPU (default: all four at once, lowered by the smoke test on OOM)")
-    p.add_argument("--skip_smoke", action="store_true")
-    p.add_argument("--smoke_only", action="store_true")
+                   help="concurrent runs per GPU (default: all four at once, lowered automatically on CUDA OOM)")
+    p.add_argument("--smoke", action="store_true",
+                   help="run the whole pipeline with tiny budgets under ROOT/smoke (tests the tooling)")
     p.add_argument("--smoke_steps", type=int, default=300)
     p.add_argument("--max_attempts", type=int, default=4, help="launches per training stage (resumes included)")
     p.add_argument("--progress_every", type=float, default=600, help="seconds between progress tables")

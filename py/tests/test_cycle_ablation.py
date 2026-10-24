@@ -69,6 +69,26 @@ def test_smoke_only_shrinks_budgets(tmp_path, monkeypatch):
     assert cfg.optimization.bs == 1024
 
 
+def test_out_of_memory_lowers_concurrency_without_using_an_attempt(tmp_path):
+    opts = SimpleNamespace(device='cpu', n_gpus=1, poll=.05, progress_every=1e9, stall_warn=1e9, stall_restart=0)
+    scheduler = cycle_ablation.Scheduler(opts, str(tmp_path), 'test')
+    script = ("import pathlib, sys\n"
+              "marker, done = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])\n"
+              "if sys.argv[3] == 'oom' and not marker.exists():\n"
+              "    marker.touch(); print('torch.OutOfMemoryError: CUDA out of memory.'); sys.exit(1)\n"
+              "done.touch()\n")
+    jobs = []
+    for name in ('a', 'b', 'c'):
+        done = tmp_path / f'{name}.done'
+        argv = [sys.executable, '-c', script, str(tmp_path / 'oom-once'), str(done), 'oom' if name == 'a' else 'ok']
+        jobs.append(cycle_ablation.Job(name, 'eval', str(tmp_path), str(tmp_path / f'{name}.log'),
+                                       lambda resume, argv=argv: argv, done.exists, max_attempts=1))
+    assert scheduler.run(jobs, 3) == []
+    assert [job.status for job in jobs] == ['done'] * 3
+    assert scheduler.per_gpu == 2
+    assert jobs[0].oom and jobs[0].attempts == 1
+
+
 def write_run(root, name, order, cycle, step):
     out = root / 'runs' / name
     out.mkdir(parents=True)

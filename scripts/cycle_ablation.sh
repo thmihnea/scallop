@@ -19,6 +19,7 @@
 #
 # then evaluates each with recipe v1 plus a round-trip check and writes
 # $WORKDIR/ablation/report.md. Rerunning resumes every stage from its latest checkpoint.
+# Until training has started, a rerun also updates the code to the branch head.
 #
 # Needs: Linux, an NVIDIA driver (nvidia-smi), git, curl, about 30 GB of disk.
 # Settings (environment variables):
@@ -28,7 +29,7 @@
 #   COMMIT        pin a commit                          (default: branch head at first launch)
 #   TORCH_CUDA    torch wheel flavour, cu126 or cu128   (default: cu128 for compute capability >= 10, else cu126)
 #   GPUS          number of GPUs to use, 0..GPUS-1      (default: all)
-#   RUNS_PER_GPU  concurrent runs per GPU               (default: all four at once; the smoke test lowers it on OOM)
+#   RUNS_PER_GPU  concurrent runs per GPU               (default: all four at once, lowered automatically on OOM)
 #   RUN_TESTS     1 to run the test suite before training (default: 1)
 #   FOREGROUND    1 to run attached instead of in the background (default: 0)
 set -Eeuo pipefail
@@ -118,6 +119,13 @@ if [[ ! -d $REPO/.git ]]; then
   say "cloning $REPO_URL ($BRANCH)"
   git clone --branch "$BRANCH" "$REPO_URL" "$REPO"
   [[ -z $COMMIT ]] || git -C "$REPO" checkout --detach "$COMMIT"
+  git -C "$REPO" rev-parse HEAD > "$WORKDIR/commit.txt"
+elif [[ ! -d $ROOT/teacher && -z $COMMIT ]]; then
+  # Nothing trained yet, so take the latest code; afterwards the commit stays pinned.
+  say "no training yet: updating the code to the head of $BRANCH"
+  git -C "$REPO" fetch --quiet origin "$BRANCH"
+  git -C "$REPO" checkout --quiet --detach FETCH_HEAD
+  git -C "$REPO" rev-parse HEAD > "$WORKDIR/commit.txt"
 fi
 [[ -f $WORKDIR/commit.txt ]] || git -C "$REPO" rev-parse HEAD > "$WORKDIR/commit.txt"
 commit=$(git -C "$REPO" rev-parse HEAD)
@@ -203,6 +211,6 @@ fi
 args=(run --root "$ROOT" --data_dir "$REPO/datasets/ts")
 (( GPUS > 0 )) && args+=(--n_gpus "$GPUS")
 (( RUNS_PER_GPU > 0 )) && args+=(--runs_per_gpu "$RUNS_PER_GPU")
-say "launching the ablation: smoke pass, teacher, four runs, evaluation (progress tables follow)"
+say "launching the ablation: teacher, four runs, evaluation (progress tables follow)"
 "$PY" "${ORCHESTRATOR[@]}" "${args[@]}"
 say "===== done: $ROOT/report.md ====="
