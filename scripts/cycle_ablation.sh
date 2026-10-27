@@ -98,7 +98,11 @@ case $command in
       say "not running"
       exit 0
     fi
-    say "stopping; running stages save a checkpoint first (this can take a few minutes). Rerun to resume."
+    say "stopping; running stages save a checkpoint first (this can take a few minutes)"
+    # Wait for every stage, not just the signal: a stage still alive would keep writing into
+    # its output folder (and recreate it if it was moved).
+    while pgrep -f -- "py/launchers/.*$ROOT" > /dev/null; do sleep 5; done
+    say "stopped. Rerun to resume."
     exit 0 ;;
   start) ;;
   *) die "unknown command '$command' (start | status | logs | report | stop)" ;;

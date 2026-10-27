@@ -256,7 +256,10 @@ class Job:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            self.step = int(record.get("step", self.step))
+            step = int(record.get("step", self.step))
+            if step < self.step:  # resumed from an earlier checkpoint: the old rate no longer applies
+                self.history.clear()
+            self.step = step
             self.loss = record.get("train/loss", self.loss)
             self.diag_v = record.get("diag/velocity_loss", self.diag_v)
             if self.diag_v_first is None:
@@ -584,6 +587,9 @@ class Pipeline:
             out_dir = os.path.join(self.root, "runs", name)
             cfg = read_json(os.path.join(out_dir, "config.json"))
             failed = [k for k, ok in config_checks(cfg, order, cycle, self.recipe).items() if not ok] if cfg else []
+            if cfg is None and os.path.isdir(out_dir) and any(f.endswith(".pt") for f in os.listdir(out_dir)):
+                failed = ["checkpoints without a config.json, e.g. written by a stage still running "
+                          "when the folder was moved"]
             if failed:
                 aside = os.path.join(self.root, "superseded")
                 raise SystemExit(f"{name} was trained with other settings ({'; '.join(failed)}). To start it "

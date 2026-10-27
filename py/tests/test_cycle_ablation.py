@@ -100,6 +100,10 @@ def test_a_run_trained_with_other_settings_is_never_resumed(tmp_path, monkeypatc
     (tmp_path / 'runs' / 'run3_square_cycle' / 'config.json').write_text(json.dumps(cfg))
     with pytest.raises(SystemExit, match=r"run3_square_cycle was trained with other settings .* mv "):
         paper.refuse_superseded_runs()
+    (tmp_path / 'runs' / 'run3_square_cycle' / 'config.json').unlink()
+    torch.save({'step': 14000}, tmp_path / 'runs' / 'run3_square_cycle' / 'm_signal.pt')
+    with pytest.raises(SystemExit, match='checkpoints without a config.json'):
+        paper.refuse_superseded_runs()
 
 
 def test_resume_keeps_the_budgets_an_ablation_started_with():
