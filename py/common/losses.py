@@ -354,20 +354,28 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         d_loss = _sum_non_batch((d - target_d.detach()) ** 2) / _get_div_loss_scaling(net)
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
     base = weighted_velocity + d_loss
+    cycle_weight = net.calc_cycle_weight(s, t) if cycle is not None and hasattr(net, "calc_cycle_weight") else None
     if cycle is not None:
         cycle_v, cycle_d = cycle
-        base = base + cycle_v + cycle_d
+        if cycle_weight is None:
+            base = base + cycle_v + cycle_d
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
         value = torch.exp(-weight) * base + weight
     else:
         value = math.exp(-weight) * base + weight
+    if cycle_weight is not None:
+        # Its own learned weight: e^{-w_c} L_cyc + w_c, balanced separately from LSD.
+        cycle_weight = cycle_weight.reshape(-1)
+        value = value + torch.exp(-cycle_weight) * (cycle_v + cycle_d) + cycle_weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
     if cycle is not None:
         metrics[f"{family}/cycle_v_loss"] = cycle_v.detach()
         metrics[f"{family}/cycle_div_loss"] = cycle_d.detach()
+    if cycle_weight is not None:
+        metrics[f"{family}/cycle_logvar"] = cycle_weight.detach()
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -378,11 +386,29 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     return value, metrics
 
 
-def _cycle_loss(net, s, t, x, u, d):
-    """Live round-trip residuals u(x,s,t) - u(X,t,s) and d(x,s,t) - d(X,t,s)."""
+def _cycle_loss(net, s, t, x, u, d, stopgrad="none"):
+    """Round-trip residuals u(x,s,t) - u(X,t,s) and d(x,s,t) - d(X,t,s).
+
+    ``none`` keeps every path live. ``directional`` follows the self-distillation
+    rule: of the two jumps, the one running forward in time (the sampler, anchored
+    to the diagonal by LSD) is the stopped target and only the backward-in-time
+    jump learns; the landing point X is detached, as in LSD.
+    """
+    if stopgrad not in ("none", "directional"):
+        raise ValueError(f"Unknown cycle_stopgrad: {stopgrad!r} (expected 'none' or 'directional')")
+    directional = stopgrad == "directional"
+    land = x + _bcast(t - s, u) * (u.detach() if directional else u)
     back_u, back_d = _split_div(net.calc_phi(
-        t, s, x + _bcast(t - s, u) * u, train=False, return_div=True,
+        t, s, land.detach() if directional else land, train=False, return_div=True,
     ))
+    if directional:
+        def target_forward(first, second):
+            # Per sample: stop whichever jump goes forward in time (first iff t > s).
+            forward = _bcast(t - s, first) > 0
+            return torch.where(forward, first.detach(), first), torch.where(forward, second, second.detach())
+        u, back_u = target_forward(u, back_u)
+        if d is not None:
+            d, back_d = target_forward(d, back_d)
     v_loss = _sum_non_batch((u - back_u) ** 2)
     if d is None:
         return v_loss, torch.zeros_like(v_loss)
@@ -392,7 +418,7 @@ def _cycle_loss(net, s, t, x, u, d):
 def lsd_term(
     net, teacher_params, x0, x1, label, s, t, *, interp,
     stopgrad_type="stopped", density_ema_params=None, eps=None, generator=None,
-    cycle_loss=False,
+    cycle_loss=False, cycle_stopgrad="none",
 ):
     """u + delta*partial_t u = sg(v_t(X_theta)); likewise for raw d.
 
@@ -400,15 +426,16 @@ def lsd_term(
     Velocity uses the explicitly selected teacher. Density uses its own EMA
     diagonal source at the detached CURRENT student endpoint. Divergence
     estimators and source conditional labels are never used at that endpoint.
-    ``cycle_loss`` adds the round-trip losses of :func:`_cycle_loss` inside
-    the learned weight.
+    ``cycle_loss`` adds the round-trip losses of :func:`_cycle_loss` (stopped as
+    ``cycle_stopgrad`` says), under their own learned weight when the network has
+    one and inside the LSD weight otherwise.
     """
     _validate_stopgrad(stopgrad_type)
     x = interp.calc_It(s, x0, x1)
     primal, tangent = _raw_jvp(net, s, t, x)
     u, d = _split_div(primal)
     dt_u, dt_d = _split_div(tangent)
-    cycle = _cycle_loss(net, s, t, x, u, d) if cycle_loss else None
+    cycle = _cycle_loss(net, s, t, x, u, d, cycle_stopgrad) if cycle_loss else None
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
@@ -593,8 +620,11 @@ def setup_loss(cfg, net, interp):
             raise ValueError("esd_imf requires conditional diagonal supervision")
     psd_type = getattr(cfg.training, "psd_type", None)
     cycle_loss = getattr(cfg.training, "cycle_loss", False)
+    cycle_stopgrad = getattr(cfg.training, "cycle_stopgrad", "none")
     if cycle_loss and loss_type != "lsd":
         raise ValueError("cycle_loss requires loss_type='lsd'")
+    if cycle_stopgrad not in ("none", "directional"):
+        raise ValueError(f"Unknown cycle_stopgrad: {cycle_stopgrad!r}")
     if getattr(net.config, "predict_divergence", False):
         if not math.isfinite(net.config.divergence_rescale) or net.config.divergence_rescale <= 0:
             raise ValueError("Density training requires a finite positive divergence_rescale")
@@ -624,6 +654,7 @@ def setup_loss(cfg, net, interp):
                 net, teacher, x0, x1, label, s, t,
                 interp=interp, stopgrad_type=stopgrad_type,
                 density_ema_params=density_ema, cycle_loss=cycle_loss,
+                cycle_stopgrad=cycle_stopgrad,
             )
         elif loss_type in ESD_LOSS_TYPES:
             return esd_term(

@@ -96,20 +96,31 @@ class TorchFlowMap(nn.Module):
             # magnitude-preserving (weight-normalized) head + zero init -> logvar==0 at
             # init and bounded thereafter (plain nn.Linear diverged to ~1e17).
             self.logvar_linear = _MPLinear(self.logvar_channels)
+        # The cycle loss gets its own learned log-variance w_c(s, t) on the same features.
+        self.cycle_logvar = bool(self.use_weight and getattr(config, "cycle_logvar", False))
+        if self.cycle_logvar:
+            self.logvar_cycle_linear = _MPLinear(self.logvar_channels)
 
     # ------------------------------------------------------------------ #
     # weight function
     # ------------------------------------------------------------------ #
-    def calc_weight(self, s, t):
-        if not self.use_weight:
-            return 0.0  # log variance 0 => exactly the unweighted squared loss
+    def _logvar_features(self, s, t):
         s = torch.as_tensor(s, dtype=torch.float32)
         t = torch.as_tensor(t, dtype=torch.float32)
         embed_s = self.logvar_fourier_s(s).reshape(-1, self.logvar_channels)
         embed_t = self.logvar_fourier_t(t).reshape(-1, self.logvar_channels)
-        embed = (embed_s + embed_t) / math.sqrt(2.0)
-        logvar = self.logvar_linear(embed).reshape(-1, 1, 1)
-        return logvar
+        return (embed_s + embed_t) / math.sqrt(2.0)
+
+    def calc_weight(self, s, t):
+        if not self.use_weight:
+            return 0.0  # log variance 0 => exactly the unweighted squared loss
+        return self.logvar_linear(self._logvar_features(s, t)).reshape(-1, 1, 1)
+
+    def calc_cycle_weight(self, s, t):
+        """Learned log-variance of the cycle loss, or None when it shares calc_weight."""
+        if not getattr(self, "cycle_logvar", False):
+            return None
+        return self.logvar_cycle_linear(self._logvar_features(s, t)).reshape(-1, 1, 1)
 
     # ------------------------------------------------------------------ #
     # core network evaluation

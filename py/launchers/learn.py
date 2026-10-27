@@ -99,6 +99,10 @@ def parse_command_line_arguments():
                         help="configured EMA decay for density consistency (default: first EMA)")
     parser.add_argument("--cycle_loss", action="store_true",
                         help="add the velocity and density round-trip (cycle) losses to LSD")
+    parser.add_argument("--cycle_stopgrad", choices=["none", "directional"], default=None,
+                        help="with --cycle_loss: 'none' keeps every path live (default); 'directional' "
+                             "stops the forward-in-time jump and the landing point so only the "
+                             "backward-in-time jump learns from the cycle")
     parser.add_argument("--offdiag_time_order", choices=["square", "forward"], default=None,
                         help="off-diagonal time pairs: independent square or ordered forward")
     parser.add_argument("--diag_tmax", type=float, default=None,
@@ -123,11 +127,13 @@ def parse_command_line_arguments():
     parser.add_argument("--log_freq", type=int, default=None,
                         help="scalar logging frequency; saves/evaluation keep their own frequencies")
     parser.add_argument("--total_steps", type=int, default=None, help="override stage budget (velocity: 400k; density/flow map: 100k)")
-    parser.add_argument("--training_recipe", choices=["branched_muon"], default=None,
-                        help="dlogpdt LSD/PSD/ESD: 4 shared + 2 blocks/head, Muon/AdamW, "
+    parser.add_argument("--training_recipe", choices=["branched_muon", "paper"], default=None,
+                        help="branched_muon (dlogpdt LSD/PSD/ESD): 4 shared + 2 blocks/head, Muon/AdamW, "
                              "sqrt decay after 50k without warmup, forward times, vectorized/linear density, "
-                             "and CUDA graphs on CUDA; explicit flags override the recipe")
-    parser.add_argument("--optimizer", choices=["radam", "muon_adamw"], default=None,
+                             "and CUDA graphs on CUDA. paper (pretrain_v or dlogpdt): the SCALLOP paper's "
+                             "AdamW, 2.5%% warm-up + sqrt decay, batch 1000, 4e6 steps, learned loss weights, "
+                             "eps 1e-5 and 6 shared + 3 density blocks. Explicit flags override the recipe")
+    parser.add_argument("--optimizer", choices=["radam", "muon_adamw", "adamw"], default=None,
                         help="default Muon uses hidden attention/MLP matrices with auxiliary AdamW; radam opts out")
     parser.add_argument("--decay_steps", type=int, default=None,
                         help="decay scale for --schedule_type sqrt (cosine uses total_steps)")
@@ -267,6 +273,9 @@ def setup_config_dict(args):
     if recipe == "branched_muon":
         from common.training_recipes import apply_branched_muon
         apply_branched_muon(cfg, mode=args.mode, device=args.device)
+    elif recipe == "paper":
+        from common.training_recipes import apply_paper
+        apply_paper(cfg, mode=args.mode)
     sampling_steps = getattr(args, "n_sampling_steps", None)
     if sampling_steps is not None:
         if any(step < 1 for step in sampling_steps):
@@ -427,8 +436,13 @@ def setup_config_dict(args):
         cfg.logging.output_name = cfg.logging.wandb_name
     if args.cycle_loss:
         cfg.training.cycle_loss = True
-        cfg.logging.wandb_name += "_cycle"
+        cfg.training.cycle_stopgrad = args.cycle_stopgrad or "none"
+        if cfg.network.use_weight:
+            cfg.network.cycle_logvar = True  # its own learned e^{-w_c} weight
+        cfg.logging.wandb_name += "_cycle" + ("_sgdir" if cfg.training.cycle_stopgrad == "directional" else "")
         cfg.logging.output_name = cfg.logging.wandb_name
+    elif args.cycle_stopgrad is not None:
+        raise ValueError("--cycle_stopgrad requires --cycle_loss")
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
         cfg.logging.output_name = cfg.logging.wandb_name

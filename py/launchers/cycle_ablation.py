@@ -11,7 +11,11 @@ the code's ``forward`` order, s <= t:
 
 Each stage is the README command (velocity teacher, then ``--mode dlogpdt`` from
 that teacher) with only these flags added, so all four share the teacher, the
-seed and every recipe hyperparameter. Each run is evaluated with recipe v1 and
+seed and every recipe hyperparameter. ``--recipe paper`` trains the teacher and all
+four runs with the paper's stated setup instead (``--training_recipe paper``:
+AdamW, warm-up + sqrt decay, batch 1000, learned e^{-w} loss weights, 6 + 3
+blocks), and its cycle runs stop gradients directionally under their own learned
+weight. Each run is evaluated with recipe v1 and
 eval_round_trip.py. Stages resume from their latest checkpoint after a crash, a
 stall or a rerun of this script. Runs that do not fit on a GPU together hit CUDA
 OOM; the orchestrator then lowers the runs per GPU and requeues them. ``--smoke``
@@ -64,6 +68,42 @@ RECIPE = {
     ("optimization", "learning_rate"): 1e-4,
     ("problem", "com_augmentation"): True,
 }
+# What every paper-recipe run must have resolved to (independent of apply_paper, on purpose).
+PAPER_RECIPE = {
+    ("training", "recipe"): "paper",
+    ("network", "divergence_mode"): "dlogpdt",
+    ("network", "div_loss_weighting_type"): "linear",
+    ("network", "vectorized_divergence"): True,
+    ("network", "use_weight"): True,
+    ("network", "logvar_channels"): 128,
+    ("training", "loss_type"): "lsd",
+    ("training", "stopgrad_type"): "stopped",
+    ("training", "seed"): 42,
+    ("training", "diag_teacher_source"): "external",
+    ("training", "offdiag_teacher_source"): "external",
+    ("training", "tmax"): 1 - 1e-5,
+    ("training", "diag_tmax"): 1 - 1e-5,
+    ("optimization", "optimizer"): "adamw",
+    ("optimization", "learning_rate"): 1e-4,
+    ("optimization", "weight_decay"): 1e-4,
+    ("optimization", "clip"): 10.,
+    ("optimization", "schedule_type"): "sqrt",
+    ("optimization", "warmup_fraction"): .025,
+    ("optimization", "bs"): 1000,
+    ("optimization", "diag_fraction"): .5,
+    ("problem", "com_augmentation"): True,
+}
+PAPER_LAYOUT = {"num_layers": 6, "num_shared_layers": 6, "num_div_layers": 3}
+RECIPES = {"repo": RECIPE, "paper": PAPER_RECIPE}
+STEPS = {"repo": (TEACHER_STEPS, DISTILL_STEPS), "paper": (4_000_000, 4_000_000)}
+CYCLE_FLAGS = {"repo": ["--cycle_loss"], "paper": ["--cycle_loss", "--cycle_stopgrad", "directional"]}
+# Keep every Nth-step snapshot (0 keeps all): 4e6-step runs would otherwise write 400 each.
+SNAPSHOT_EVERY = {"repo": 0, "paper": 100_000}
+# Settings the teacher must share with the runs it supervises.
+TEACHER_SHARED = [("training", "recipe"), ("training", "seed"), ("training", "tmax"), ("training", "diag_tmax"),
+                  ("network", "use_weight"), ("network", "logvar_channels"), ("network", "dit_kwargs")] + [
+                 ("optimization", k) for k in ("optimizer", "learning_rate", "weight_decay", "clip",
+                                               "schedule_type", "warmup_fraction", "decay_steps", "bs")]
 # arXiv:2606.29110 Table 1, ALA-2 at NFE 4: mean, std over 3 seeds; 2e5 SNIS samples.
 PAPER = {
     "SCALLOP": {"ess": (.088, .001), "energy-w2": (.555, .116), "torus-w2": (.310, .027)},
@@ -150,6 +190,22 @@ def final_checkpoint(out_dir, total):
     return path if path and os.path.exists(path) and checkpoint_step(path) == total else None
 
 
+def prune_snapshots(out_dir, every):
+    """Delete ``<name>_step{N}.pt`` unless N is a multiple of ``every``; the latest state stays."""
+    name = output_name(out_dir) if every else None
+    if not name:
+        return
+    prefix = f"{name}_step"
+    for entry in os.listdir(out_dir):
+        if entry.startswith(prefix) and entry.endswith(".pt"):
+            try:
+                step = int(entry[len(prefix):-3])
+            except ValueError:
+                continue
+            if step % every:
+                os.remove(os.path.join(out_dir, entry))
+
+
 # --------------------------------------------------------------------------- #
 # jobs
 # --------------------------------------------------------------------------- #
@@ -163,6 +219,7 @@ class Job:
     is_done: Callable[[], bool]
     total: int = 0
     max_attempts: int = 3
+    housekeeping: Optional[Callable[[], None]] = None
     status: str = "pending"
     gpu: Optional[int] = None
     proc: Optional[subprocess.Popen] = None
@@ -310,6 +367,8 @@ class Scheduler:
             for job in jobs:
                 if job.status == "running":
                     job.read_metrics()
+                    if job.housekeeping:
+                        job.housekeeping()
                     code = job.proc.poll()
                     if code is not None:
                         self._finish(job, code, jobs)
@@ -428,18 +487,24 @@ def gpu_count():
 class Pipeline:
     def __init__(self, opts, root, smoke):
         self.opts, self.root, self.smoke = opts, root, smoke
-        self.teacher_steps = opts.smoke_steps if smoke else TEACHER_STEPS
-        self.distill_steps = opts.smoke_steps if smoke else DISTILL_STEPS
+        self.recipe = getattr(opts, "recipe", "repo")
+        teacher_steps, distill_steps = STEPS[self.recipe]
+        self.teacher_steps = opts.smoke_steps if smoke else (getattr(opts, "teacher_steps", 0) or teacher_steps)
+        self.distill_steps = opts.smoke_steps if smoke else (getattr(opts, "distill_steps", 0) or distill_steps)
         os.makedirs(root, exist_ok=True)
         self.scheduler = Scheduler(opts, root, "smoke" if smoke else "ablation")
 
-    def _learn(self, out_dir, extra):
+    def _learn(self, out_dir, extra, total, default):
         def argv(resume):
             cmd = [sys.executable, "py/launchers/learn.py", "--cfg_path", CFG_PATH,
                    "--ts_data_dir", self.opts.data_dir, "--output_folder", out_dir] + extra
+            if self.recipe == "paper":
+                cmd += ["--training_recipe", "paper"]
             if self.smoke:
                 freq = str(max(1, self.opts.smoke_steps // 2))
-                cmd += ["--total_steps", str(self.opts.smoke_steps), "--visual_freq", freq, "--save_freq", freq]
+                cmd += ["--total_steps", str(total), "--visual_freq", freq, "--save_freq", freq]
+            elif self.recipe != "repo" or total != default:
+                cmd += ["--total_steps", str(total)]
             if self.opts.device == "cpu":
                 cmd += ["--device", "cpu"]
             if resume:
@@ -450,16 +515,18 @@ class Pipeline:
     def teacher_job(self):
         out_dir = os.path.join(self.root, "teacher")
         return Job("teacher", "train", out_dir, os.path.join(self.root, "logs", "teacher.log"),
-                   self._learn(out_dir, []), lambda: final_checkpoint(out_dir, self.teacher_steps) is not None,
-                   total=self.teacher_steps, max_attempts=self.opts.max_attempts)
+                   self._learn(out_dir, [], self.teacher_steps, TEACHER_STEPS),
+                   lambda: final_checkpoint(out_dir, self.teacher_steps) is not None,
+                   total=self.teacher_steps, max_attempts=self.opts.max_attempts,
+                   housekeeping=lambda: prune_snapshots(out_dir, SNAPSHOT_EVERY[self.recipe]))
 
     def run_jobs(self, teacher, max_attempts):
         jobs = []
         for name, order, cycle in RUNS:
             out_dir = os.path.join(self.root, "runs", name)
             extra = ["--mode", "dlogpdt", "--network_load_path", teacher, "--teacher_load_path", teacher,
-                     "--offdiag_time_order", order] + (["--cycle_loss"] if cycle else [])
-            base = self._learn(out_dir, extra)
+                     "--offdiag_time_order", order] + (CYCLE_FLAGS[self.recipe] if cycle else [])
+            base = self._learn(out_dir, extra, self.distill_steps, DISTILL_STEPS)
 
             def argv(resume, base=base, teacher=teacher):
                 cmd = base(None)
@@ -469,7 +536,8 @@ class Pipeline:
                 return cmd
             jobs.append(Job(name, "train", out_dir, os.path.join(self.root, "logs", f"{name}.log"), argv,
                             lambda d=out_dir: final_checkpoint(d, self.distill_steps) is not None,
-                            total=self.distill_steps, max_attempts=max_attempts))
+                            total=self.distill_steps, max_attempts=max_attempts,
+                            housekeeping=lambda d=out_dir: prune_snapshots(d, SNAPSHOT_EVERY[self.recipe])))
         return jobs
 
     def eval_jobs(self):
@@ -504,7 +572,7 @@ class Pipeline:
         manifest_path = os.path.join(self.root, "manifest.json")
         manifest = read_json(manifest_path, {})
         manifest.setdefault("created", datetime.datetime.now().isoformat(timespec="seconds"))
-        manifest.update(smoke=self.smoke, commit=git_commit(), device=self.opts.device,
+        manifest.update(recipe=self.recipe, smoke=self.smoke, commit=git_commit(), device=self.opts.device,
                         n_gpus=self.opts.n_gpus, runs_per_gpu=per_gpu,
                         teacher_steps=self.teacher_steps, distill_steps=self.distill_steps)
         write_json(manifest_path, manifest)
@@ -561,18 +629,18 @@ def load_run(root, name, total):
     }
 
 
-def verify(run, order, cycle, teacher, total):
-    """{check: passed} for one run, read back from what the run actually wrote."""
+def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
+    """{check: passed} for one run, read back from what the run (and its teacher) wrote."""
     cfg = run["config"]
 
-    def get(section, key):
-        return cfg.get(section, {}).get(key)
+    def get(section, key, source=None):
+        return (cfg if source is None else source).get(section, {}).get(key)
     sha = sha256(run["checkpoint"]) if run["checkpoint"] else None
-    return {
+    checks = {
         f"offdiag_time_order is {order}": get("training", "offdiag_time_order") == order,
         f"cycle_loss is {'on' if cycle else 'off'}": bool(get("training", "cycle_loss")) == cycle,
         "cycle losses logged only if on": any("lsd/cycle_v_loss" in r for r in run["records"]) == cycle,
-        "README recipe hyperparameters": all(get(*key) == value for key, value in RECIPE.items()),
+        f"{recipe} recipe hyperparameters": all(get(*key) == value for key, value in RECIPES[recipe].items()),
         "shared teacher checkpoint": teacher is not None and get("teacher", "load_path") == teacher,
         f"reached {total} optimizer steps": run["checkpoint"] is not None,
         "recipe-v1 eval of final checkpoint": bool(run["ts"]) and sha is not None
@@ -580,6 +648,16 @@ def verify(run, order, cycle, teacher, total):
         "round trip of final checkpoint": bool(run["round_trip"]) and sha is not None
         and run["round_trip"].get("checkpoint_sha256") == sha,
     }
+    if recipe == "paper":
+        layout = get("network", "dit_kwargs") or {}
+        checks["6 shared + 3 density blocks"] = all(layout.get(k) == v for k, v in PAPER_LAYOUT.items())
+        if cycle:
+            checks["directional cycle stop-gradient, own learned weight"] = (
+                get("training", "cycle_stopgrad") == "directional" and bool(get("network", "cycle_logvar")))
+    if teacher_cfg is not None:
+        checks["teacher trained with the same recipe"] = all(
+            get(*key, source=teacher_cfg) == get(*key) for key in TEACHER_SHARED)
+    return checks
 
 
 def stage(run, split, name):
@@ -602,18 +680,22 @@ def fmt(value, digits=4):
 def write_report(root, smoke=False):
     manifest = read_json(os.path.join(root, "manifest.json"), {})
     smoke = smoke or manifest.get("smoke", False)
+    recipe = manifest.get("recipe", "repo")
     total = manifest.get("distill_steps", DISTILL_STEPS)
+    teacher_cfg = read_json(os.path.join(root, "teacher", "config.json"))
     teacher = (manifest.get("teacher") or {}).get("checkpoint")
     runs = {name: load_run(root, name, total) for name, _, _ in RUNS}
     out, data = [], {"manifest": manifest, "runs": {}}
-    title = "SMOKE TEST (tiny budgets; numbers are meaningless)" if smoke else "Cycle-loss ablation, ace_a_nme (ALA-2)"
+    title = ("SMOKE TEST (tiny budgets; numbers are meaningless)" if smoke
+             else f"Cycle-loss ablation ({recipe} recipe), ace_a_nme (ALA-2)")
     out += [f"# {title}", "",
             f"Commit `{manifest.get('commit')}`; teacher {manifest.get('teacher_steps')} steps, "
             f"distillation {total} steps per run; recipe-v1 evaluation at {EVAL_STEPS} steps; one seed per run.", ""]
 
     out += ["## Verification", "", "Read back from each run's config.json, metrics.jsonl, final checkpoint "
             "and evaluation provenance.", ""]
-    checks = {name: verify(runs[name], order, cycle, teacher, total) for name, order, cycle in RUNS}
+    checks = {name: verify(runs[name], order, cycle, teacher, total, recipe, teacher_cfg)
+              for name, order, cycle in RUNS}
     for name, _, _ in RUNS:
         failed = [check for check, ok in checks[name].items() if not ok]
         out.append(f"- {name}: " + ("all checks passed (" + "; ".join(checks[name]) + ")" if not failed
@@ -679,8 +761,12 @@ def write_report(root, smoke=False):
     out += ["", "## Reading these numbers", "",
             "- One seed per run. The paper's seed std for SCALLOP (ESS ±0.001, E-W2 ±0.116, T-W2 ±0.027) "
             "is the scale of seed noise; gaps much smaller than that are not evidence.",
-            "- The paper's rows are 3 seeds, 2e5 samples, 4M AdamW updates; this repo's recipe is 100k "
-            "Muon distillation steps, 1e6 proposals and 10k resampled samples, so absolute values differ.",
+            ("- Training follows the paper's stated recipe for {:,} teacher and {:,} distillation steps "
+             "(the paper: 4,000,000 updates). Evaluation is recipe v1 (1e6 proposals, 10k resampled "
+             "samples, MALA), not the paper's 2e5 SNIS samples over 3 seeds.".format(
+                 manifest.get("teacher_steps", 0), total) if recipe == "paper" else
+             "- The paper's rows are 3 seeds, 2e5 samples, 4M AdamW updates; this repo's recipe is 100k "
+             "Muon distillation steps, 1e6 proposals and 10k resampled samples, so absolute values differ."),
             "- The paper does not name its split; transferable-samplers reports on test."]
     text = "\n".join(out) + "\n"
     with open(os.path.join(root, "report.md"), "w") as fh:
@@ -707,6 +793,10 @@ def command_run(opts):
         opts.n_gpus = 1
     if opts.smoke:
         root = os.path.join(root, "smoke")
+    existing = read_json(os.path.join(root, "manifest.json"))
+    if existing is not None and existing.get("recipe", "repo") != opts.recipe:
+        raise SystemExit(f"{root} holds a {existing.get('recipe', 'repo')}-recipe ablation; "
+                         f"use a new --root for --recipe {opts.recipe}")
     per_gpu = (opts.runs_per_gpu or read_json(os.path.join(root, "manifest.json"), {}).get("runs_per_gpu")
                or max(1, math.ceil(len(RUNS) / opts.n_gpus)))
     log(f"ablation: {len(RUNS)} runs, {opts.n_gpus} GPU(s), up to {per_gpu} run(s) per GPU")
@@ -737,6 +827,11 @@ def parse_args(argv=None):
     p.add_argument("command", choices=["run", "status", "report"])
     p.add_argument("--root", default=os.path.join(_REPO, "outputs", "cycle_ablation"))
     p.add_argument("--data_dir", default=os.path.join(_REPO, "datasets", "ts"))
+    p.add_argument("--recipe", choices=["repo", "paper"], default="repo",
+                   help="repo: README recipe; paper: the paper's setup for teacher and runs (learned weights, "
+                        "AdamW, batch 1000, 6+3 blocks) with directional, separately weighted cycle losses")
+    p.add_argument("--teacher_steps", type=int, default=0, help="teacher updates (default: the recipe's)")
+    p.add_argument("--distill_steps", type=int, default=0, help="updates per run (default: the recipe's)")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--n_gpus", type=int, default=0, help="GPUs to use, 0..n-1 (default: all)")
     p.add_argument("--runs_per_gpu", type=int, default=0,

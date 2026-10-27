@@ -9,8 +9,12 @@
 #
 # Steps: clone the invertibility branch, build a Python 3.11 env with uv (no root needed),
 # download the ace_a_nme data, check the CUDA-graph path on GPU 0, then
-# py/launchers/cycle_ablation.py trains one velocity teacher (400k steps) and four
-# SCALLOP runs (100k steps each) in parallel:
+# py/launchers/cycle_ablation.py trains one velocity teacher and four SCALLOP runs from it.
+# RECIPE=paper (default) uses the paper's stated setup for the teacher and every run: AdamW
+# at 1e-4, 2.5% warm-up then sqrt decay, batch 1000, EMA 0.999, learned e^{-w} loss weights,
+# times in [0, 1 - 1e-5], 6 shared + 3 density blocks, 4e6 updates per stage; the cycle runs
+# stop the forward-in-time jump's gradient and weight the cycle term with its own e^{-w_c}.
+# RECIPE=repo reproduces the first ablation (README recipe, 400k + 100k steps).
 #
 #   run1_square         (s, t) uniform on [0, 1]^2
 #   run2_forward        (s, t) uniform on the triangle (notes.tex: t < s), the recipe default
@@ -23,7 +27,10 @@
 #
 # Needs: Linux, an NVIDIA driver (nvidia-smi), git, curl, about 30 GB of disk.
 # Settings (environment variables):
-#   WORKDIR       where everything lives                (default: $HOME/scallop-cycle-ablation)
+#   RECIPE        paper or repo                         (default: paper)
+#   WORKDIR       where everything lives                (default: $HOME/scallop-paper-ablation;
+#                                                        RECIPE=repo: $HOME/scallop-cycle-ablation)
+#   TEACHER_STEPS / DISTILL_STEPS  updates per stage    (default: the recipe's; paper 4000000 each)
 #   REPO_URL      repository to clone                   (default: https://github.com/thmihnea/scallop.git)
 #   BRANCH        branch to clone                       (default: feat/invertibility_losses)
 #   COMMIT        pin a commit                          (default: branch head at first launch)
@@ -34,7 +41,11 @@
 #   FOREGROUND    1 to run attached instead of in the background (default: 0)
 set -Eeuo pipefail
 
-WORKDIR=${WORKDIR:-$HOME/scallop-cycle-ablation}
+RECIPE=${RECIPE:-paper}
+[[ $RECIPE == paper || $RECIPE == repo ]] || { echo "RECIPE must be paper or repo"; exit 1; }
+WORKDIR=${WORKDIR:-$HOME/$([[ $RECIPE == repo ]] && echo scallop-cycle-ablation || echo scallop-paper-ablation)}
+TEACHER_STEPS=${TEACHER_STEPS:-0}
+DISTILL_STEPS=${DISTILL_STEPS:-0}
 REPO_URL=${REPO_URL:-https://github.com/thmihnea/scallop.git}
 BRANCH=${BRANCH:-feat/invertibility_losses}
 COMMIT=${COMMIT:-}
@@ -187,9 +198,11 @@ if [[ $RUN_TESTS == 1 && ! -f $WORKDIR/tests_passed_$commit ]]; then
 fi
 
 # ---------------------------------------------------------------- ablation
-args=(run --root "$ROOT" --data_dir "$REPO/datasets/ts")
+args=(run --root "$ROOT" --data_dir "$REPO/datasets/ts" --recipe "$RECIPE")
+(( TEACHER_STEPS > 0 )) && args+=(--teacher_steps "$TEACHER_STEPS")
+(( DISTILL_STEPS > 0 )) && args+=(--distill_steps "$DISTILL_STEPS")
 (( GPUS > 0 )) && args+=(--n_gpus "$GPUS")
 (( RUNS_PER_GPU > 0 )) && args+=(--runs_per_gpu "$RUNS_PER_GPU")
-say "launching the ablation: teacher, four runs, evaluation (progress tables follow)"
+say "launching the $RECIPE-recipe ablation: teacher, four runs, evaluation (progress tables follow)"
 "$PY" "${ORCHESTRATOR[@]}" "${args[@]}"
 say "===== done: $ROOT/report.md ====="

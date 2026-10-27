@@ -69,6 +69,32 @@ def test_smoke_only_shrinks_budgets(tmp_path, monkeypatch):
     assert cfg.optimization.bs == 1024
 
 
+@pytest.mark.parametrize('index', range(4))
+def test_paper_runs_and_teacher_pass_every_recipe_check(tmp_path, monkeypatch, index):
+    name, order, cycle = cycle_ablation.RUNS[index]
+    opts = SimpleNamespace(device='cpu', data_dir='datasets/ts', smoke_steps=300, recipe='paper', max_attempts=4,
+                           teacher_steps=0, distill_steps=0)
+    paper = cycle_ablation.Pipeline(opts, str(tmp_path), smoke=False)
+    cfg = resolve(paper.run_jobs(TEACHER, 1)[index].argv(None), monkeypatch).to_dict()
+    teacher_cfg = resolve(paper.teacher_job().argv(None), monkeypatch).to_dict()
+    assert cfg['optimization']['total_steps'] == teacher_cfg['optimization']['total_steps'] == 4_000_000
+    run = {'config': cfg, 'records': [{'lsd/cycle_v_loss': .1}] if cycle else [],
+           'checkpoint': None, 'ts': None, 'round_trip': None}
+    checks = cycle_ablation.verify(run, order, cycle, TEACHER, 4_000_000, 'paper', teacher_cfg)
+    assert [k for k, ok in checks.items() if not ok] == [
+        'reached 4000000 optimizer steps', 'recipe-v1 eval of final checkpoint', 'round trip of final checkpoint']
+    assert ('directional cycle stop-gradient, own learned weight' in checks) is cycle
+
+
+def test_snapshot_pruning_keeps_multiples_and_the_latest_state(tmp_path):
+    (tmp_path / 'config.json').write_text(json.dumps({'logging': {'output_name': 'm'}}))
+    kept = ['m.pt', 'm_signal.pt', 'm_best_ess.pt', 'm_step20.pt', 'm_step40.pt', 'm_step50.pt.tmp']
+    for name in kept + ['m_step10.pt', 'm_step30.pt']:
+        (tmp_path / name).write_text('')
+    cycle_ablation.prune_snapshots(str(tmp_path), 20)
+    assert sorted(p.name for p in tmp_path.iterdir() if p.suffix != '.json') == sorted(kept)
+
+
 def test_out_of_memory_lowers_concurrency_without_using_an_attempt(tmp_path):
     opts = SimpleNamespace(device='cpu', n_gpus=1, poll=.05, progress_every=1e9, stall_warn=1e9, stall_restart=0)
     scheduler = cycle_ablation.Scheduler(opts, str(tmp_path), 'test')
