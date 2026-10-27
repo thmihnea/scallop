@@ -81,15 +81,24 @@ case $command in
   report)
     cd "$REPO" && exec "$PY" "${ORCHESTRATOR[@]}" report --root "$ROOT" ;;
   stop)
-    # The detached job leads its own session: signal its process group. The orchestrator
-    # then stops its training processes, which save a checkpoint first.
-    leader=$(pgrep -o -f "cycle_ablation.sh start" || true)
-    if [[ -n $leader ]]; then
+    # pid files, not process names: the script may be saved under any name.
+    # alive PIDFILE PATTERN: the pid in PIDFILE if that process is alive and its command matches.
+    alive() {
+      local pid
+      pid=$(cat "$1" 2> /dev/null) || return 1
+      [[ -n $pid ]] && tr '\0' ' ' 2> /dev/null < "/proc/$pid/cmdline" | grep -q -- "$2" && echo "$pid"
+    }
+    if leader=$(alive "$WORKDIR/job.pid" " start"); then
+      # The detached job leads its own session: signal its process group. The orchestrator
+      # then stops its training processes, which save a checkpoint first.
       kill -TERM -- "-$leader" 2> /dev/null || kill -TERM "$leader"
-      say "stopping; running stages save a checkpoint first (this can take a few minutes). Rerun to resume."
+    elif orchestrator=$(alive "$ROOT/orchestrator.pid" "cycle_ablation.py"); then
+      kill -TERM "$orchestrator"
     else
       say "not running"
+      exit 0
     fi
+    say "stopping; running stages save a checkpoint first (this can take a few minutes). Rerun to resume."
     exit 0 ;;
   start) ;;
   *) die "unknown command '$command' (start | status | logs | report | stop)" ;;
@@ -109,6 +118,7 @@ if [[ -z ${ABLATION_DETACHED:-} && $FOREGROUND != 1 ]]; then
 fi
 exec 9> "$LOCK"
 flock -n 9 || die "another ablation holds $LOCK"
+echo $$ > "$WORKDIR/job.pid"
 
 say "===== cycle-loss ablation: setup on $(hostname) ====="
 
