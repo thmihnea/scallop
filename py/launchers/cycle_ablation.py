@@ -779,6 +779,19 @@ def write_report(root, smoke=False):
 # --------------------------------------------------------------------------- #
 # entry points
 # --------------------------------------------------------------------------- #
+def pin_budgets(opts, manifest):
+    """Resume with the step budgets an ablation started with; they also set its LR schedule."""
+    for key in ("teacher_steps", "distill_steps"):
+        started = manifest.get(key)
+        if started is None:
+            continue
+        requested = getattr(opts, key)
+        if requested and requested != started:
+            raise SystemExit(f"this ablation started with {key}={started}; refusing {requested} "
+                             f"(it would change the schedule mid-run). Use a new root for a new budget.")
+        setattr(opts, key, started)
+
+
 def command_run(opts):
     root = os.path.abspath(opts.root)
     os.makedirs(root, exist_ok=True)
@@ -797,6 +810,8 @@ def command_run(opts):
     if existing is not None and existing.get("recipe", "repo") != opts.recipe:
         raise SystemExit(f"{root} holds a {existing.get('recipe', 'repo')}-recipe ablation; "
                          f"use a new --root for --recipe {opts.recipe}")
+    if existing is not None and not opts.smoke:
+        pin_budgets(opts, existing)
     per_gpu = (opts.runs_per_gpu or read_json(os.path.join(root, "manifest.json"), {}).get("runs_per_gpu")
                or max(1, math.ceil(len(RUNS) / opts.n_gpus)))
     log(f"ablation: {len(RUNS)} runs, {opts.n_gpus} GPU(s), up to {per_gpu} run(s) per GPU")

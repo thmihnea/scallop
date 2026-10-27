@@ -86,6 +86,15 @@ def test_paper_runs_and_teacher_pass_every_recipe_check(tmp_path, monkeypatch, i
     assert ('directional cycle stop-gradient, own learned weight' in checks) is cycle
 
 
+def test_resume_keeps_the_budgets_an_ablation_started_with():
+    manifest = {'teacher_steps': 400_000, 'distill_steps': 100_000}
+    opts = SimpleNamespace(teacher_steps=0, distill_steps=0)
+    cycle_ablation.pin_budgets(opts, manifest)
+    assert (opts.teacher_steps, opts.distill_steps) == (400_000, 100_000)
+    with pytest.raises(SystemExit, match='distill_steps=100000'):
+        cycle_ablation.pin_budgets(SimpleNamespace(teacher_steps=0, distill_steps=4_000_000), manifest)
+
+
 def test_snapshot_pruning_keeps_multiples_and_the_latest_state(tmp_path):
     (tmp_path / 'config.json').write_text(json.dumps({'logging': {'output_name': 'm'}}))
     kept = ['m.pt', 'm_signal.pt', 'm_best_ess.pt', 'm_step20.pt', 'm_step40.pt', 'm_step50.pt.tmp']
