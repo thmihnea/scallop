@@ -179,11 +179,18 @@ import torch
 assert hasattr(torch.optim, "Muon"), "this torch has no torch.optim.Muon"
 assert torch.cuda.is_available(), "torch cannot see CUDA (driver too old for this wheel?)"
 for i in range(torch.cuda.device_count()):
-    major, minor = torch.cuda.get_device_capability(i)
-    assert f"sm_{major}{minor}" in torch.cuda.get_arch_list() or major * 10 + minor < 70, \
-        f"GPU {i} (sm_{major}{minor}) not in this wheel's {torch.cuda.get_arch_list()}; set TORCH_CUDA"
-    x = torch.randn(512, 512, device=f"cuda:{i}")
-    torch.testing.assert_close((x @ x.T).cpu(), x.cpu() @ x.cpu().T, rtol=1e-3, atol=1e-2)
+    # Run real kernels: a wheel can serve a GPU through a compatible arch (sm_86 code on
+    # sm_89), so the arch list alone is not the test.
+    name, (major, minor) = torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i)
+    try:
+        x = torch.randn(512, 512, device=f"cuda:{i}")
+        product = (x @ x.T).cpu()
+        assert torch.isfinite(torch.nn.functional.gelu(x).softmax(-1).sum()).item()
+    except RuntimeError as exc:
+        raise SystemExit(f"GPU {i} ({name}, sm_{major}{minor}) cannot run torch {torch.__version__} "
+                         f"(arches {torch.cuda.get_arch_list()}): {exc}. Set TORCH_CUDA.")
+    torch.testing.assert_close(product, x.cpu() @ x.cpu().T, rtol=1e-3, atol=1e-2)
+    print(f"GPU {i}: {name} (sm_{major}{minor}) OK", flush=True)
 print(f"torch {torch.__version__}: {torch.cuda.device_count()} GPU(s) OK")
 EOF
 
