@@ -14,8 +14,8 @@ that teacher) with only these flags added, so all four share the teacher, the
 seed and every recipe hyperparameter. ``--recipe paper`` trains the teacher and all
 four runs with the paper's stated setup instead (``--training_recipe paper``:
 AdamW, warm-up + sqrt decay, batch 1000, learned e^{-w} loss weights, 6 + 3
-blocks), and its cycle runs stop gradients directionally under their own learned
-weight. Each run is evaluated with recipe v1 and
+blocks), and its cycle runs stop gradients directionally, with the cycle term inside
+LSD's learned weight. Each run is evaluated with recipe v1 and
 eval_round_trip.py. Stages resume from their latest checkpoint after a crash, a
 stall or a rerun of this script. Runs that do not fit on a GPU together hit CUDA
 OOM; the orchestrator then lowers the runs per GPU and requeues them. ``--smoke``
@@ -229,11 +229,14 @@ class Job:
     started: float = 0.0
     step: int = 0
     loss: Optional[float] = None
+    diag_v: Optional[float] = None  # learned weights report train/loss ~ 1 + log L; this one shows a blow-up
+    diag_v_first: Optional[float] = None
     cycle: Optional[float] = None
     ess: Optional[float] = None
     offset: int = 0
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=512))
     warned: bool = False
+    diverged: bool = False
 
     def activity(self):
         paths = (self.log_path, os.path.join(self.out_dir, "metrics.jsonl"))
@@ -255,6 +258,9 @@ class Job:
                 continue
             self.step = int(record.get("step", self.step))
             self.loss = record.get("train/loss", self.loss)
+            self.diag_v = record.get("diag/velocity_loss", self.diag_v)
+            if self.diag_v_first is None:
+                self.diag_v_first = self.diag_v
             self.cycle = record.get("lsd/cycle_v_loss", self.cycle)
             for key, value in record.items():
                 if key.endswith("resampled/effective-sample-size") and "/mean/" not in key:
@@ -367,6 +373,10 @@ class Scheduler:
             for job in jobs:
                 if job.status == "running":
                     job.read_metrics()
+                    if job.diag_v_first and job.diag_v > 10 * job.diag_v_first and not job.diverged:
+                        job.diverged = True
+                        log(f"{self.title}: WARNING {job.name} may have diverged: diagonal velocity loss "
+                            f"{job.diag_v:.4g}, it started at {job.diag_v_first:.4g}")
                     if job.housekeeping:
                         job.housekeeping()
                     code = job.proc.poll()
@@ -409,7 +419,7 @@ class Scheduler:
         lines = [f"===== {self.title} | {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | "
                  f"elapsed {duration(time.time() - self.started)} ====="]
         header = f"{'job':<30}{'state':<9}{'gpu':>4} {'step':>15} {'%':>6} {'it/s':>6} {'ETA':>8} " \
-                 f"{'loss':>10} {'cycle_v':>9} {'val ESS':>8} {'quiet':>7}"
+                 f"{'loss':>10} {'diag_v':>9} {'cycle_v':>9} {'val ESS':>8} {'quiet':>7}"
         lines.append(header)
         for job in jobs:
             rate = job.rate()
@@ -422,7 +432,7 @@ class Scheduler:
             lines.append(
                 f"{job.name:<30}{job.status:<9}{num(job.gpu, 'd'):>4} "
                 f"{(f'{job.step}/{job.total}' if job.total else '-'):>15} {num(pct, '.1f'):>6} "
-                f"{num(rate, '.2f'):>6} {duration(eta):>8} {num(job.loss, '.4g'):>10} "
+                f"{num(rate, '.2f'):>6} {duration(eta):>8} {num(job.loss, '.4g'):>10} {num(job.diag_v, '.3g'):>9} "
                 f"{num(job.cycle, '.3g'):>9} {num(job.ess, '.4f'):>8} {duration(quiet):>7}")
             if job.kind == "eval" and job.status == "running":
                 last = tail(job.log_path, 1)
@@ -568,11 +578,27 @@ class Pipeline:
                             lambda r, a=round_trip: a, done_trip, max_attempts=2))
         return jobs
 
+    def refuse_superseded_runs(self):
+        """Never resume a run whose saved config differs from what this code would launch."""
+        for name, order, cycle in RUNS:
+            out_dir = os.path.join(self.root, "runs", name)
+            cfg = read_json(os.path.join(out_dir, "config.json"))
+            failed = [k for k, ok in config_checks(cfg, order, cycle, self.recipe).items() if not ok] if cfg else []
+            if failed:
+                aside = os.path.join(self.root, "superseded")
+                raise SystemExit(f"{name} was trained with other settings ({'; '.join(failed)}). To start it "
+                                 f"afresh, move it aside: mkdir -p {aside} && mv {out_dir} {aside}/")
+
     def execute(self, per_gpu):
+        self.refuse_superseded_runs()
         manifest_path = os.path.join(self.root, "manifest.json")
         manifest = read_json(manifest_path, {})
         manifest.setdefault("created", datetime.datetime.now().isoformat(timespec="seconds"))
-        manifest.update(recipe=self.recipe, smoke=self.smoke, commit=git_commit(), device=self.opts.device,
+        commit = git_commit()
+        commits = manifest.setdefault("commits", [manifest["commit"]] if manifest.get("commit") else [])
+        if not commits or commits[-1] != commit:
+            commits.append(commit)
+        manifest.update(recipe=self.recipe, smoke=self.smoke, commit=commit, device=self.opts.device,
                         n_gpus=self.opts.n_gpus, runs_per_gpu=per_gpu,
                         teacher_steps=self.teacher_steps, distill_steps=self.distill_steps)
         write_json(manifest_path, manifest)
@@ -629,6 +655,24 @@ def load_run(root, name, total):
     }
 
 
+def config_checks(cfg, order, cycle, recipe):
+    """{check: passed} on a run's resolved config alone: what it trains, not how far it got."""
+    def get(section, key):
+        return cfg.get(section, {}).get(key)
+    checks = {
+        f"offdiag_time_order is {order}": get("training", "offdiag_time_order") == order,
+        f"cycle_loss is {'on' if cycle else 'off'}": bool(get("training", "cycle_loss")) == cycle,
+        f"{recipe} recipe hyperparameters": all(get(*key) == value for key, value in RECIPES[recipe].items()),
+    }
+    if recipe == "paper":
+        layout = get("network", "dit_kwargs") or {}
+        checks["6 shared + 3 density blocks"] = all(layout.get(k) == v for k, v in PAPER_LAYOUT.items())
+        if cycle:
+            checks["directional cycle stop-gradient, inside LSD's learned weight"] = (
+                get("training", "cycle_stopgrad") == "directional" and not get("network", "cycle_logvar"))
+    return checks
+
+
 def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
     """{check: passed} for one run, read back from what the run (and its teacher) wrote."""
     cfg = run["config"]
@@ -637,10 +681,8 @@ def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
         return (cfg if source is None else source).get(section, {}).get(key)
     sha = sha256(run["checkpoint"]) if run["checkpoint"] else None
     checks = {
-        f"offdiag_time_order is {order}": get("training", "offdiag_time_order") == order,
-        f"cycle_loss is {'on' if cycle else 'off'}": bool(get("training", "cycle_loss")) == cycle,
+        **config_checks(cfg, order, cycle, recipe),
         "cycle losses logged only if on": any("lsd/cycle_v_loss" in r for r in run["records"]) == cycle,
-        f"{recipe} recipe hyperparameters": all(get(*key) == value for key, value in RECIPES[recipe].items()),
         "shared teacher checkpoint": teacher is not None and get("teacher", "load_path") == teacher,
         f"reached {total} optimizer steps": run["checkpoint"] is not None,
         "recipe-v1 eval of final checkpoint": bool(run["ts"]) and sha is not None
@@ -648,12 +690,6 @@ def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
         "round trip of final checkpoint": bool(run["round_trip"]) and sha is not None
         and run["round_trip"].get("checkpoint_sha256") == sha,
     }
-    if recipe == "paper":
-        layout = get("network", "dit_kwargs") or {}
-        checks["6 shared + 3 density blocks"] = all(layout.get(k) == v for k, v in PAPER_LAYOUT.items())
-        if cycle:
-            checks["directional cycle stop-gradient, own learned weight"] = (
-                get("training", "cycle_stopgrad") == "directional" and bool(get("network", "cycle_logvar")))
     if teacher_cfg is not None:
         checks["teacher trained with the same recipe"] = all(
             get(*key, source=teacher_cfg) == get(*key) for key in TEACHER_SHARED)
@@ -688,8 +724,10 @@ def write_report(root, smoke=False):
     out, data = [], {"manifest": manifest, "runs": {}}
     title = ("SMOKE TEST (tiny budgets; numbers are meaningless)" if smoke
              else f"Cycle-loss ablation ({recipe} recipe), ace_a_nme (ALA-2)")
+    earlier = (manifest.get("commits") or [])[:-1]
     out += [f"# {title}", "",
-            f"Commit `{manifest.get('commit')}`; teacher {manifest.get('teacher_steps')} steps, "
+            f"Commit `{manifest.get('commit')}`"
+            + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "") + "; teacher {manifest.get('teacher_steps')} steps, "
             f"distillation {total} steps per run; recipe-v1 evaluation at {EVAL_STEPS} steps; one seed per run.", ""]
 
     out += ["## Verification", "", "Read back from each run's config.json, metrics.jsonl, final checkpoint "
@@ -844,7 +882,7 @@ def parse_args(argv=None):
     p.add_argument("--data_dir", default=os.path.join(_REPO, "datasets", "ts"))
     p.add_argument("--recipe", choices=["repo", "paper"], default="repo",
                    help="repo: README recipe; paper: the paper's setup for teacher and runs (learned weights, "
-                        "AdamW, batch 1000, 6+3 blocks) with directional, separately weighted cycle losses")
+                        "AdamW, batch 1000, 6+3 blocks) with directional cycle losses inside LSD's learned weight")
     p.add_argument("--teacher_steps", type=int, default=0, help="teacher updates (default: the recipe's)")
     p.add_argument("--distill_steps", type=int, default=0, help="updates per run (default: the recipe's)")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")

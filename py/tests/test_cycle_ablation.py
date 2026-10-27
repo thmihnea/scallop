@@ -83,7 +83,23 @@ def test_paper_runs_and_teacher_pass_every_recipe_check(tmp_path, monkeypatch, i
     checks = cycle_ablation.verify(run, order, cycle, TEACHER, 4_000_000, 'paper', teacher_cfg)
     assert [k for k, ok in checks.items() if not ok] == [
         'reached 4000000 optimizer steps', 'recipe-v1 eval of final checkpoint', 'round trip of final checkpoint']
-    assert ('directional cycle stop-gradient, own learned weight' in checks) is cycle
+    assert ("directional cycle stop-gradient, inside LSD's learned weight" in checks) is cycle
+
+
+def test_a_run_trained_with_other_settings_is_never_resumed(tmp_path, monkeypatch):
+    opts = SimpleNamespace(device='cpu', data_dir='datasets/ts', smoke_steps=300, recipe='paper', max_attempts=4,
+                           teacher_steps=0, distill_steps=0)
+    paper = cycle_ablation.Pipeline(opts, str(tmp_path), smoke=False)
+    for index in (0, 2):
+        name, _, _ = cycle_ablation.RUNS[index]
+        cfg = resolve(paper.run_jobs(TEACHER, 1)[index].argv(None), monkeypatch).to_dict()
+        (tmp_path / 'runs' / name).mkdir(parents=True)
+        (tmp_path / 'runs' / name / 'config.json').write_text(json.dumps(cfg))
+    paper.refuse_superseded_runs()  # what this code launches: resumable
+    cfg['network']['cycle_logvar'] = True  # run3 as first launched, with its own cycle weight
+    (tmp_path / 'runs' / 'run3_square_cycle' / 'config.json').write_text(json.dumps(cfg))
+    with pytest.raises(SystemExit, match=r"run3_square_cycle was trained with other settings .* mv "):
+        paper.refuse_superseded_runs()
 
 
 def test_resume_keeps_the_budgets_an_ablation_started_with():

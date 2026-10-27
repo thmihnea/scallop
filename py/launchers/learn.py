@@ -103,6 +103,10 @@ def parse_command_line_arguments():
                         help="with --cycle_loss: 'none' keeps every path live (default); 'directional' "
                              "stops the forward-in-time jump and the landing point so only the "
                              "backward-in-time jump learns from the cycle")
+    parser.add_argument("--cycle_weight", choices=["shared", "own"], default=None,
+                        help="with --cycle_loss and learned weights: 'shared' (default) puts the cycle "
+                             "term inside LSD's e^{-w(s,t)}; 'own' gives it a separate e^{-w_c}, which "
+                             "can run away (the cycle has zero-loss maps, so log L_cyc is unbounded below)")
     parser.add_argument("--offdiag_time_order", choices=["square", "forward"], default=None,
                         help="off-diagonal time pairs: independent square or ordered forward")
     parser.add_argument("--diag_tmax", type=float, default=None,
@@ -437,12 +441,15 @@ def setup_config_dict(args):
     if args.cycle_loss:
         cfg.training.cycle_loss = True
         cfg.training.cycle_stopgrad = args.cycle_stopgrad or "none"
-        if cfg.network.use_weight:
+        if args.cycle_weight == "own":
+            if not cfg.network.use_weight:
+                raise ValueError("--cycle_weight own requires learned weights (--use_weight)")
             cfg.network.cycle_logvar = True  # its own learned e^{-w_c} weight
-        cfg.logging.wandb_name += "_cycle" + ("_sgdir" if cfg.training.cycle_stopgrad == "directional" else "")
+        cfg.logging.wandb_name += "_cycle" + ("_sgdir" if cfg.training.cycle_stopgrad == "directional" else "") \
+            + ("_ownw" if args.cycle_weight == "own" else "")
         cfg.logging.output_name = cfg.logging.wandb_name
-    elif args.cycle_stopgrad is not None:
-        raise ValueError("--cycle_stopgrad requires --cycle_loss")
+    elif args.cycle_stopgrad is not None or args.cycle_weight is not None:
+        raise ValueError("--cycle_stopgrad and --cycle_weight require --cycle_loss")
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
         cfg.logging.output_name = cfg.logging.wandb_name

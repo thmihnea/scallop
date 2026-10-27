@@ -44,13 +44,17 @@ def test_paper_recipe_keeps_explicit_overrides_and_rejects_other_modes(monkeypat
         resolve(['--mode', 'pretrain_flowmap', '--training_recipe', 'paper'], monkeypatch)
 
 
-def test_cycle_flags_resolve_with_their_own_weight_only_when_weights_are_learned(monkeypatch):
+def test_cycle_term_shares_the_lsd_weight_unless_asked_for_its_own(monkeypatch):
     stage = ['--mode', 'dlogpdt', '--teacher_load_path', 't.pt', '--cycle_loss', '--cycle_stopgrad', 'directional']
     cfg = resolve([*stage, '--training_recipe', 'paper'], monkeypatch)
-    assert cfg.training.cycle_stopgrad == 'directional' and cfg.network.cycle_logvar
-    assert not hasattr(resolve(stage, monkeypatch).network, 'cycle_logvar')
-    with pytest.raises(ValueError, match='requires --cycle_loss'):
-        resolve(['--mode', 'dlogpdt', '--cycle_stopgrad', 'directional'], monkeypatch)
+    assert cfg.training.cycle_stopgrad == 'directional' and not getattr(cfg.network, 'cycle_logvar', False)
+    own = resolve([*stage, '--training_recipe', 'paper', '--cycle_weight', 'own'], monkeypatch)
+    assert own.network.cycle_logvar and own.logging.output_name == cfg.logging.output_name + '_ownw'
+    with pytest.raises(ValueError, match='requires learned weights'):
+        resolve([*stage, '--cycle_weight', 'own'], monkeypatch)
+    for flags in (['--cycle_stopgrad', 'directional'], ['--cycle_weight', 'shared']):
+        with pytest.raises(ValueError, match='require --cycle_loss'):
+            resolve(['--mode', 'dlogpdt', *flags], monkeypatch)
 
 
 def test_sqrt_schedule_warms_up_linearly_then_decays():

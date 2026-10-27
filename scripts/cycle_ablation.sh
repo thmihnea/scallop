@@ -13,7 +13,7 @@
 # RECIPE=paper (default) uses the paper's stated setup for the teacher and every run: AdamW
 # at 1e-4, 2.5% warm-up then sqrt decay, batch 1000, EMA 0.999, learned e^{-w} loss weights,
 # times in [0, 1 - 1e-5], 6 shared + 3 density blocks, 4e6 updates per stage; the cycle runs
-# stop the forward-in-time jump's gradient and weight the cycle term with its own e^{-w_c}.
+# stop the forward-in-time jump's gradient and put the cycle term inside LSD's e^{-w(s,t)}.
 # RECIPE=repo reproduces the first ablation (README recipe, 400k + 100k steps).
 #
 #   run1_square         (s, t) uniform on [0, 1]^2
