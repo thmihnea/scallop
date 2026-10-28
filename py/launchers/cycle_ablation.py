@@ -733,7 +733,7 @@ def write_report(root, smoke=False):
     earlier = (manifest.get("commits") or [])[:-1]
     out += [f"# {title}", "",
             f"Commit `{manifest.get('commit')}`"
-            + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "") + "; teacher {manifest.get('teacher_steps')} steps, "
+            + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "") + f"; teacher {manifest.get('teacher_steps')} steps, "
             f"distillation {total} steps per run; recipe-v1 evaluation at {EVAL_STEPS} steps; one seed per run.", ""]
 
     out += ["## Verification", "", "Read back from each run's config.json, metrics.jsonl, final checkpoint "
