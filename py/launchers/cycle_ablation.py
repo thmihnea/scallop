@@ -509,6 +509,8 @@ class Pipeline:
         teacher_steps, distill_steps = STEPS[self.recipe]
         self.teacher_steps = opts.smoke_steps if smoke else (getattr(opts, "teacher_steps", 0) or teacher_steps)
         self.distill_steps = opts.smoke_steps if smoke else (getattr(opts, "distill_steps", 0) or distill_steps)
+        flowmap_steps = getattr(opts, "flowmap_steps", 0)  # 0: SCALLOP starts from the velocity teacher
+        self.flowmap_steps = opts.smoke_steps if smoke and flowmap_steps else flowmap_steps
         os.makedirs(root, exist_ok=True)
         self.scheduler = Scheduler(opts, root, "smoke" if smoke else "ablation")
 
@@ -538,23 +540,34 @@ class Pipeline:
                    total=self.teacher_steps, max_attempts=self.opts.max_attempts,
                    housekeeping=lambda: prune_snapshots(out_dir, SNAPSHOT_EVERY[self.recipe]))
 
-    def run_jobs(self, teacher, max_attempts):
+    def flowmap_jobs(self, teacher, max_attempts):
+        """Velocity-only flow maps, one per run, distilled from the teacher with the run's LSD settings."""
+        mode = ["--mode", "pretrain_flowmap", "--offdiag_teacher_source", "external", "--stopgrad_type", "stopped"]
+        return self._stage_jobs("flowmaps", mode, teacher, {}, self.flowmap_steps, None, max_attempts)
+
+    def run_jobs(self, teacher, max_attempts, flowmaps=None):
+        """SCALLOP runs, each starting from the teacher or from its own pretrained flow map."""
+        return self._stage_jobs("runs", ["--mode", "dlogpdt"], teacher, flowmaps or {}, self.distill_steps,
+                                DISTILL_STEPS, max_attempts)
+
+    def _stage_jobs(self, stage, mode, teacher, inits, total, default, max_attempts):
         jobs = []
         for name, order, cycle in RUNS:
-            out_dir = os.path.join(self.root, "runs", name)
-            extra = ["--mode", "dlogpdt", "--network_load_path", teacher, "--teacher_load_path", teacher,
-                     "--offdiag_time_order", order] + (CYCLE_FLAGS[self.recipe] if cycle else [])
-            base = self._learn(out_dir, extra, self.distill_steps, DISTILL_STEPS)
+            out_dir = os.path.join(self.root, stage, name)
+            extra = mode + ["--network_load_path", inits.get(name, teacher), "--teacher_load_path", teacher,
+                            "--offdiag_time_order", order] + (CYCLE_FLAGS[self.recipe] if cycle else [])
+            base = self._learn(out_dir, extra, total, default)
 
-            def argv(resume, base=base, teacher=teacher):
+            def argv(resume, base=base):
                 cmd = base(None)
                 if resume:  # the student restarts from its own state; the teacher stays fixed
                     cmd[cmd.index("--network_load_path") + 1] = resume
                     cmd.append("--resume_optimizer")
                 return cmd
-            jobs.append(Job(name, "train", out_dir, os.path.join(self.root, "logs", f"{name}.log"), argv,
-                            lambda d=out_dir: final_checkpoint(d, self.distill_steps) is not None,
-                            total=self.distill_steps, max_attempts=max_attempts,
+            job = name if stage == "runs" else f"{stage}/{name}"
+            jobs.append(Job(job, "train", out_dir, os.path.join(self.root, "logs", job.replace("/", "_") + ".log"),
+                            argv, lambda d=out_dir: final_checkpoint(d, total) is not None,
+                            total=total, max_attempts=max_attempts,
                             housekeeping=lambda d=out_dir: prune_snapshots(d, SNAPSHOT_EVERY[self.recipe])))
         return jobs
 
@@ -611,7 +624,8 @@ class Pipeline:
             commits.append(commit)
         manifest.update(recipe=self.recipe, smoke=self.smoke, commit=commit, device=self.opts.device,
                         n_gpus=self.opts.n_gpus, runs_per_gpu=per_gpu,
-                        teacher_steps=self.teacher_steps, distill_steps=self.distill_steps)
+                        teacher_steps=self.teacher_steps, flowmap_steps=self.flowmap_steps,
+                        distill_steps=self.distill_steps)
         write_json(manifest_path, manifest)
 
         teacher = self.teacher_job()
@@ -621,7 +635,17 @@ class Pipeline:
         manifest["teacher"] = {"checkpoint": ckpt, "sha256": sha256(ckpt), "resumed_at": teacher.resumes}
         write_json(manifest_path, manifest)
 
-        runs = self.run_jobs(ckpt, 1 if self.smoke else self.opts.max_attempts)
+        attempts = 1 if self.smoke else self.opts.max_attempts
+        flowmaps = {}
+        if self.flowmap_steps:
+            jobs = self.flowmap_jobs(ckpt, attempts)
+            failed = self.scheduler.run(jobs, per_gpu)
+            if failed:
+                return failed
+            flowmaps = {name: final_checkpoint(job.out_dir, self.flowmap_steps) for (name, _, _), job in zip(RUNS, jobs)}
+            manifest["flowmaps"] = flowmaps
+            write_json(manifest_path, manifest)
+        runs = self.run_jobs(ckpt, attempts, flowmaps)
         failed = self.scheduler.run(runs, per_gpu)
         manifest["runs"] = {job.name: {"resumed_at": job.resumes, "attempts": job.attempts,
                                        "status": job.status, "oom": job.oom} for job in runs}
@@ -741,10 +765,13 @@ def write_report(root, smoke=False):
     title = ("SMOKE TEST (tiny budgets; numbers are meaningless)" if smoke
              else f"Cycle-loss ablation ({recipe} recipe), ace_a_nme (ALA-2)")
     earlier = (manifest.get("commits") or [])[:-1]
+    flowmap = manifest.get("flowmap_steps")
     out += [f"# {title}", "",
             f"Commit `{manifest.get('commit')}`"
-            + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "") + f"; teacher {manifest.get('teacher_steps')} steps, "
-            f"distillation {total} steps per run; one training seed per run; evaluated as in the paper "
+            + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "")
+            + f"; teacher {manifest.get('teacher_steps')} steps; "
+            + (f"each run pretrains its own flow map for {flowmap} steps, then " if flowmap else "")
+            + f"distillation {total} steps per run; one training seed per run; evaluated as in the paper "
             f"({PAPER_SAMPLES:,} samples at {EVAL_STEPS} steps, mean ± std over {len(EVAL_SEEDS)} sampling seeds).", ""]
 
     out += ["## Verification", "", "Read back from each run's config.json, metrics.jsonl, final checkpoint "
@@ -838,7 +865,7 @@ def write_report(root, smoke=False):
 # --------------------------------------------------------------------------- #
 def pin_budgets(opts, manifest):
     """Resume with the step budgets an ablation started with; they also set its LR schedule."""
-    for key in ("teacher_steps", "distill_steps"):
+    for key in ("teacher_steps", "flowmap_steps", "distill_steps"):
         started = manifest.get(key)
         if started is None:
             continue
@@ -903,6 +930,8 @@ def parse_args(argv=None):
                    help="repo: README recipe; paper: the paper's setup for teacher and runs (learned weights, "
                         "AdamW, batch 1000, 6+3 blocks) with directional cycle losses inside LSD's learned weight")
     p.add_argument("--teacher_steps", type=int, default=0, help="teacher updates (default: the recipe's)")
+    p.add_argument("--flowmap_steps", type=int, default=0,
+                   help="velocity-only flow-map pretraining per run before SCALLOP (default 0: none)")
     p.add_argument("--distill_steps", type=int, default=0, help="updates per run (default: the recipe's)")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--n_gpus", type=int, default=0, help="GPUs to use, 0..n-1 (default: all)")

@@ -20,7 +20,7 @@ def resolve(argv, monkeypatch):
     return cfg
 
 
-@pytest.mark.parametrize('mode', ['pretrain_v', 'dlogpdt'])
+@pytest.mark.parametrize('mode', ['pretrain_v', 'pretrain_flowmap', 'dlogpdt'])
 def test_paper_recipe_resolves_to_the_stated_setup(mode, monkeypatch):
     stage = [] if mode == 'pretrain_v' else ['--network_load_path', 't.pt', '--teacher_load_path', 't.pt']
     cfg = resolve(['--mode', mode, '--training_recipe', 'paper', *stage], monkeypatch)
@@ -42,7 +42,7 @@ def test_paper_recipe_keeps_explicit_overrides_and_rejects_other_modes(monkeypat
                    '--total_steps', '1234', '--teacher_load_path', 't.pt'], monkeypatch)
     assert cfg.training.offdiag_time_order == 'square' and cfg.optimization.total_steps == 1234
     with pytest.raises(ValueError, match='paper recipe'):
-        resolve(['--mode', 'pretrain_flowmap', '--training_recipe', 'paper'], monkeypatch)
+        resolve(['--mode', 'hutchinson', '--training_recipe', 'paper'], monkeypatch)
 
 
 def test_cycle_stopgrad_resolves_and_requires_the_cycle_loss(monkeypatch):

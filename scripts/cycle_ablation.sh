@@ -31,6 +31,8 @@
 #   WORKDIR       where everything lives                (default: $HOME/scallop-paper-ablation;
 #                                                        RECIPE=repo: $HOME/scallop-cycle-ablation)
 #   TEACHER_STEPS / DISTILL_STEPS  updates per stage    (default: the recipe's; paper 4000000 each)
+#   FLOWMAP_STEPS updates of a velocity-only flow map per run, distilled from the teacher before
+#                 SCALLOP starts from it                (default: 0, SCALLOP starts from the teacher)
 #   REPO_URL      repository to clone                   (default: https://github.com/thmihnea/scallop.git)
 #   BRANCH        branch to clone                       (default: feat/invertibility_losses)
 #   COMMIT        pin a commit                          (default: branch head at first launch)
@@ -46,6 +48,7 @@ RECIPE=${RECIPE:-paper}
 WORKDIR=${WORKDIR:-$HOME/$([[ $RECIPE == repo ]] && echo scallop-cycle-ablation || echo scallop-paper-ablation)}
 TEACHER_STEPS=${TEACHER_STEPS:-0}
 DISTILL_STEPS=${DISTILL_STEPS:-0}
+FLOWMAP_STEPS=${FLOWMAP_STEPS:-0}
 REPO_URL=${REPO_URL:-https://github.com/thmihnea/scallop.git}
 BRANCH=${BRANCH:-feat/invertibility_losses}
 COMMIT=${COMMIT:-}
@@ -221,6 +224,7 @@ fi
 # ---------------------------------------------------------------- ablation
 args=(run --root "$ROOT" --data_dir "$REPO/datasets/ts" --recipe "$RECIPE")
 (( TEACHER_STEPS > 0 )) && args+=(--teacher_steps "$TEACHER_STEPS")
+(( FLOWMAP_STEPS > 0 )) && args+=(--flowmap_steps "$FLOWMAP_STEPS")
 (( DISTILL_STEPS > 0 )) && args+=(--distill_steps "$DISTILL_STEPS")
 (( GPUS > 0 )) && args+=(--n_gpus "$GPUS")
 (( RUNS_PER_GPU > 0 )) && args+=(--runs_per_gpu "$RUNS_PER_GPU")

@@ -106,7 +106,8 @@ teacher and four SCALLOP runs (square or forward time pairs, each with and witho
 e^{-w} loss weights, times in [0, 1 - 1e-5], 6 shared + 3 density blocks, 4e6 updates per
 stage); its cycle runs stop gradients directionally (`--cycle_stopgrad directional`) inside
 LSD's learned weight. `RECIPE=repo` reproduces the first ablation with the README recipe.
-`TEACHER_STEPS` and `DISTILL_STEPS` set the budgets.
+`TEACHER_STEPS` and `DISTILL_STEPS` set the budgets; `FLOWMAP_STEPS` first distills a
+velocity-only flow map per run from the teacher, and SCALLOP then starts from it.
 
 ```bash
 bash scripts/cycle_ablation.sh          # start, then follow the log

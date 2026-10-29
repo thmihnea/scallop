@@ -62,6 +62,21 @@ def test_resume_restores_student_but_keeps_teacher(tmp_path, monkeypatch):
     assert cfg.training.cycle_loss and cfg.training.offdiag_time_order == 'forward'
 
 
+def test_flow_maps_are_distilled_from_the_teacher_and_seed_their_runs(tmp_path, monkeypatch):
+    opts = SimpleNamespace(device='cpu', data_dir='datasets/ts', smoke_steps=300, recipe='paper', max_attempts=4,
+                           teacher_steps=0, distill_steps=500_000, flowmap_steps=500_000)
+    paper = cycle_ablation.Pipeline(opts, str(tmp_path), smoke=False)
+    flow = resolve(paper.flowmap_jobs(TEACHER, 1)[3].argv(None), monkeypatch)
+    assert flow.network.divergence_mode == 'pretrain_flowmap' and not flow.network.predict_divergence
+    assert (flow.training.diag_teacher_source, flow.training.offdiag_teacher_source) == ('external', 'external')
+    assert flow.training.stopgrad_type == 'stopped' and flow.training.offdiag_time_order == 'forward'
+    assert flow.training.cycle_loss and flow.optimization.total_steps == 500_000
+    assert flow.network.load_path == flow.teacher.load_path == TEACHER
+    run = resolve(paper.run_jobs(TEACHER, 1, {'run4_forward_cycle': '/ckpt/flowmap.pt'})[3].argv(None), monkeypatch)
+    assert (run.network.load_path, run.teacher.load_path) == ('/ckpt/flowmap.pt', TEACHER)
+    assert run.network.divergence_mode == 'dlogpdt' and run.optimization.total_steps == 500_000
+
+
 def test_smoke_only_shrinks_budgets(tmp_path, monkeypatch):
     cfg = resolve(pipeline(tmp_path, smoke=True).run_jobs(TEACHER, 1)[0].argv(None), monkeypatch)
     assert cfg.optimization.total_steps == 300

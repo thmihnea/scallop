@@ -43,13 +43,13 @@ PAPER_LOGVAR_CHANNELS = 128
 
 
 def apply_paper(cfg, *, mode):
-    """The paper's stated setup, for the velocity teacher and the distilled flow map alike.
+    """The paper's stated setup, for the velocity teacher, a velocity-only flow map and SCALLOP alike.
 
     Call after selecting the loss family and before explicit CLI overrides, which
     still apply (e.g. --total_steps, --offdiag_time_order).
     """
-    if mode not in ("pretrain_v", "dlogpdt"):
-        raise ValueError("the paper recipe covers --mode pretrain_v (teacher) and dlogpdt (SCALLOP)")
+    if mode not in ("pretrain_v", "pretrain_flowmap", "dlogpdt"):
+        raise ValueError("the paper recipe covers --mode pretrain_v (teacher), pretrain_flowmap and dlogpdt (SCALLOP)")
     cfg.training.recipe = "paper"
     cfg.training.tmax = 1. - PAPER_EPS
     cfg.training.diag_tmax = 1. - PAPER_EPS
