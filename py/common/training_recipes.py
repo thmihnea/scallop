@@ -31,7 +31,7 @@ AAAAAA_PRETRAIN_V_DEFAULTS = dict(
 # EMA 0.999, batch 1000, 4e6 updates, learned e^{-w} loss weights (Eq. 24), times in
 # [0, 1 - 1e-5], and a DiT with 6 shared and 3 log-density blocks. The paper leaves the
 # sqrt decay onset and the weight network's width unstated; these keep the repo's 50k
-# steps and EDM2's 128 Fourier channels.
+# steps and EDM2's 128 log-variance channels.
 PAPER_EPS = 1e-5
 PAPER_DEFAULTS = dict(
     optimizer="adamw", learning_rate=1e-4, weight_decay=1e-4, clip=10.,

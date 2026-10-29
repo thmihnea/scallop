@@ -62,31 +62,6 @@ def test_directional_cycle_trains_only_the_backward_in_time_jump(density, vector
     torch.testing.assert_close(torch.autograd.grad(got.sum(), (net.p, net.q), allow_unused=True), wanted)
 
 
-def test_cycle_term_has_its_own_learned_weight():
-    from common.flow_map import TorchFlowMap
-    from test_simplification import tiny_config
-    cfg = tiny_config()
-    cfg.network.update(use_weight=True, logvar_channels=8, cycle_logvar=True)
-    torch.manual_seed(0)
-    net = TorchFlowMap(cfg.network)
-    with torch.no_grad():
-        for p in net.parameters():
-            p.add_(.05 * torch.randn_like(p))
-    frozen = {n: p.detach().clone() for n, p in net.named_parameters()}
-    x0, x1 = torch.randn(4, 22, 3), .3 * torch.randn(4, 22, 3)
-    s, t = torch.tensor([.1, .2, .7, .5]), torch.tensor([.6, .9, .3, .55])
-    kw = dict(interp=interpolant.setup_interpolant(cfg), density_ema_params=frozen)
-    base, _ = losses.lsd_term(net, frozen, x0, x1, None, s, t, **kw)
-    value, metrics = losses.lsd_term(net, frozen, x0, x1, None, s, t, cycle_loss=True,
-                                     cycle_stopgrad='directional', **kw)
-    w_c = net.calc_cycle_weight(s, t).reshape(-1)
-    cycle = metrics['lsd/cycle_v_loss'] + metrics['lsd/cycle_div_loss']
-    torch.testing.assert_close(value - base, torch.exp(-w_c) * cycle + w_c)
-    assert not torch.allclose(w_c, net.calc_weight(s, t).reshape(-1))
-    grad = torch.autograd.grad(value.sum(), net.logvar_cycle_linear.weight)[0]
-    assert grad.abs().sum() > 0
-
-
 def test_setup_rejects_cycle_loss_outside_lsd():
     cfg = SimpleNamespace(training=SimpleNamespace(
         loss_type='psd', stopgrad_type='stopped', psd_type='uniform', cycle_loss=True,

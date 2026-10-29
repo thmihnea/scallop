@@ -1,10 +1,11 @@
 """The paper's training setup (--training_recipe paper) for the teacher and the distilled map."""
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from common import distributed, state_utils
+from common import distributed, losses, state_utils
 from common.flow_map import TorchFlowMap
 from configs.ace_a_nme import get_config
 from launchers import learn
@@ -44,17 +45,24 @@ def test_paper_recipe_keeps_explicit_overrides_and_rejects_other_modes(monkeypat
         resolve(['--mode', 'pretrain_flowmap', '--training_recipe', 'paper'], monkeypatch)
 
 
-def test_cycle_term_shares_the_lsd_weight_unless_asked_for_its_own(monkeypatch):
-    stage = ['--mode', 'dlogpdt', '--teacher_load_path', 't.pt', '--cycle_loss', '--cycle_stopgrad', 'directional']
-    cfg = resolve([*stage, '--training_recipe', 'paper'], monkeypatch)
-    assert cfg.training.cycle_stopgrad == 'directional' and not getattr(cfg.network, 'cycle_logvar', False)
-    own = resolve([*stage, '--training_recipe', 'paper', '--cycle_weight', 'own'], monkeypatch)
-    assert own.network.cycle_logvar and own.logging.output_name == cfg.logging.output_name + '_ownw'
-    with pytest.raises(ValueError, match='requires learned weights'):
-        resolve([*stage, '--cycle_weight', 'own'], monkeypatch)
-    for flags in (['--cycle_stopgrad', 'directional'], ['--cycle_weight', 'shared']):
-        with pytest.raises(ValueError, match='require --cycle_loss'):
-            resolve(['--mode', 'dlogpdt', *flags], monkeypatch)
+def test_cycle_stopgrad_resolves_and_requires_the_cycle_loss(monkeypatch):
+    cfg = resolve(['--mode', 'dlogpdt', '--teacher_load_path', 't.pt', '--training_recipe', 'paper',
+                   '--cycle_loss', '--cycle_stopgrad', 'directional'], monkeypatch)
+    assert cfg.training.cycle_stopgrad == 'directional' and '_cycle_sgdir' in cfg.logging.output_name
+    with pytest.raises(ValueError, match='requires --cycle_loss'):
+        resolve(['--mode', 'dlogpdt', '--cycle_stopgrad', 'directional'], monkeypatch)
+
+
+def test_learned_weights_see_the_full_square_density_error():
+    # Eq. 24 weights a squared error; the factorized value can be negative, leaving e^{-w} L + w unbounded.
+    net = SimpleNamespace(use_weight=False, config=SimpleNamespace(
+        div_loss_weighting_type='linear', vectorized_divergence=True, input_dims=(22, 3)))
+    pred, target, t = torch.randn(4, 22, 3), torch.randn(4, 22, 3), torch.rand(4)
+    factorized = losses._calc_div_loss(net, pred, target, t)
+    net.use_weight = True
+    full = losses._calc_div_loss(net, pred, target, t)
+    torch.testing.assert_close(full, (pred - target).square().sum((1, 2)) * (1 - t) / 66)
+    torch.testing.assert_close(full - factorized, target.square().sum((1, 2)) * (1 - t) / 66)
 
 
 def test_sqrt_schedule_warms_up_linearly_then_decays():
@@ -86,7 +94,7 @@ def test_adamw_is_recorded_and_never_restored_into_another_optimizer():
 
 def test_evaluation_loads_checkpoints_trained_with_learned_weights(tmp_path):
     cfg = tiny_config()
-    cfg.network.update(use_weight=True, logvar_channels=8, cycle_logvar=True)
+    cfg.network.update(use_weight=True, logvar_channels=8)
     state = saved_model(cfg, tmp_path / 'weighted.pt')
     net, step, _ = state_utils.load_evaluation_model(tiny_config(), str(tmp_path / 'weighted.pt'), 'cpu',
                                                      require_saved_ema=True, ema_factor=.999)

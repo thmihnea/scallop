@@ -104,8 +104,8 @@ teacher and four SCALLOP runs (square or forward time pairs, each with and witho
 `RECIPE=paper` (the default) trains the teacher and every run with the paper's stated setup
 (`--training_recipe paper`: AdamW, 2.5% warm-up then sqrt decay, batch 1000, learned
 e^{-w} loss weights, times in [0, 1 - 1e-5], 6 shared + 3 density blocks, 4e6 updates per
-stage); its cycle runs stop gradients directionally (`--cycle_stopgrad directional`) under
-their own learned weight. `RECIPE=repo` reproduces the first ablation with the README recipe.
+stage); its cycle runs stop gradients directionally (`--cycle_stopgrad directional`) inside
+LSD's learned weight. `RECIPE=repo` reproduces the first ablation with the README recipe.
 `TEACHER_STEPS` and `DISTILL_STEPS` set the budgets.
 
 ```bash

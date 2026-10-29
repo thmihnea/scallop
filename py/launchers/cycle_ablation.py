@@ -674,8 +674,7 @@ def config_checks(cfg, order, cycle, recipe):
         layout = get("network", "dit_kwargs") or {}
         checks["6 shared + 3 density blocks"] = all(layout.get(k) == v for k, v in PAPER_LAYOUT.items())
         if cycle:
-            checks["directional cycle stop-gradient, inside LSD's learned weight"] = (
-                get("training", "cycle_stopgrad") == "directional" and not get("network", "cycle_logvar"))
+            checks["directional cycle stop-gradient"] = get("training", "cycle_stopgrad") == "directional"
     return checks
 
 

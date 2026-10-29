@@ -23,9 +23,6 @@ import os
 import sys
 import time
 
-# Keep optional Flax checkpoint imports on CPU; torch owns the GPU.
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_THIS_DIR, "..")))
 
