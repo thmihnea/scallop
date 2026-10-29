@@ -34,6 +34,7 @@ import json
 import math
 import os
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -111,7 +112,10 @@ PAPER = {
     "FALCON": {"ess": (.067, .013), "energy-w2": (.225, .104), "torus-w2": (.402, .021)},
     "FALCON-A": {"ess": (.097, .007), "energy-w2": (.512, .038), "torus-w2": (.180, .005)},
 }
-PAPER_SAMPLES = 200_000  # proposals per evaluation, as in the paper (recipe v1 alone draws 1e6)
+# Evaluated like Table 1: 2e5 samples (recipe v1 alone draws 1e6) and three sampling seeds. The paper
+# does not say what its seeds vary; its ESS spread (+-0.001) is that of resampling one model.
+PAPER_SAMPLES = 200_000
+EVAL_SEEDS = (0, 1, 2)
 SMOKE_EVAL = ["--n_generate_samples", "20000", "--n_eval_samples", "1000", "--posthoc_mala_steps", "128"]
 
 
@@ -562,23 +566,22 @@ class Pipeline:
             ckpt = final_checkpoint(os.path.join(self.root, "runs", name), self.distill_steps)
             out_dir = os.path.join(self.root, "eval", name)
             device = ["--device", self.opts.device]
-            evaluate = [sys.executable, "py/launchers/eval_peptide_ts.py", "--cfg_path", CFG_PATH,
-                        "--eval_recipe", "v1", "--ts_data_dir", self.opts.data_dir, "--out_dir", out_dir,
-                        "--ckpt_path", ckpt, "--batch_size", "1000", "--n_workers", workers,
-                        "--n_generate_samples", str(PAPER_SAMPLES)] + device
+            logs = os.path.join(self.root, "logs")
+            for seed in EVAL_SEEDS:  # eval_peptide_ts's default batch is the paper's 1e4
+                seed_dir = os.path.join(out_dir, f"seed{seed}")
+                evaluate = [sys.executable, "py/launchers/eval_peptide_ts.py", "--cfg_path", CFG_PATH,
+                            "--eval_recipe", "v1", "--ts_data_dir", self.opts.data_dir, "--out_dir", seed_dir,
+                            "--ckpt_path", ckpt, "--n_workers", workers, "--seed", str(seed),
+                            "--n_generate_samples", str(PAPER_SAMPLES)] + device + (SMOKE_EVAL if self.smoke else [])
+                done_recipe = lambda d=seed_dir, c=ckpt: (read_json(os.path.join(d, "ts_metrics.json"), {})
+                                                         .get("provenance", {}).get("checkpoint_sha256") == sha256(c))
+                jobs.append(Job(f"{name}:eval{seed}", "eval", seed_dir, os.path.join(logs, f"{name}.eval{seed}.log"),
+                                lambda r, a=evaluate: a, done_recipe, max_attempts=2))
             round_trip = [sys.executable, "py/launchers/eval_round_trip.py", "--cfg_path", CFG_PATH,
                           "--ckpt_path", ckpt, "--out_dir", out_dir, "--ts_data_dir", self.opts.data_dir,
-                          "--steps", str(EVAL_STEPS)] + device
-            if self.smoke:
-                evaluate += SMOKE_EVAL
-                round_trip += ["--n_samples", "2000"]
-            done_recipe = lambda d=out_dir, c=ckpt: (read_json(os.path.join(d, "ts_metrics.json"), {})
-                                                    .get("provenance", {}).get("checkpoint_sha256") == sha256(c))
+                          "--steps", str(EVAL_STEPS)] + device + (["--n_samples", "2000"] if self.smoke else [])
             done_trip = lambda d=out_dir, c=ckpt: (read_json(os.path.join(d, "round_trip.json"), {})
                                                   .get("checkpoint_sha256") == sha256(c))
-            logs = os.path.join(self.root, "logs")
-            jobs.append(Job(f"{name}:eval", "eval", out_dir, os.path.join(logs, f"{name}.eval.log"),
-                            lambda r, a=evaluate: a, done_recipe, max_attempts=2))
             jobs.append(Job(f"{name}:round_trip", "eval", out_dir, os.path.join(logs, f"{name}.round_trip.log"),
                             lambda r, a=round_trip: a, done_trip, max_attempts=2))
         return jobs
@@ -658,7 +661,7 @@ def load_run(root, name, total):
         "config": read_json(os.path.join(out_dir, "config.json"), {}),
         "records": records,
         "checkpoint": final_checkpoint(out_dir, total) if os.path.exists(out_dir) else None,
-        "ts": read_json(os.path.join(eval_dir, "ts_metrics.json")),
+        "ts": [read_json(os.path.join(eval_dir, f"seed{seed}", "ts_metrics.json")) for seed in EVAL_SEEDS],
         "round_trip": read_json(os.path.join(eval_dir, "round_trip.json")),
     }
 
@@ -692,8 +695,8 @@ def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
         "cycle losses logged only if on": any("lsd/cycle_v_loss" in r for r in run["records"]) == cycle,
         "shared teacher checkpoint": teacher is not None and get("teacher", "load_path") == teacher,
         f"reached {total} optimizer steps": run["checkpoint"] is not None,
-        "recipe-v1 eval of final checkpoint": bool(run["ts"]) and sha is not None
-        and run["ts"].get("provenance", {}).get("checkpoint_sha256") == sha,
+        "recipe-v1 eval of final checkpoint": sha is not None and all(
+            ts and ts.get("provenance", {}).get("checkpoint_sha256") == sha for ts in run["ts"] or [None]),
         "round trip of final checkpoint": bool(run["round_trip"]) and sha is not None
         and run["round_trip"].get("checkpoint_sha256") == sha,
     }
@@ -703,9 +706,9 @@ def verify(run, order, cycle, teacher, total, recipe="repo", teacher_cfg=None):
     return checks
 
 
-def stage(run, split, name):
+def stage(ts, split, name):
     try:
-        steps = run["ts"]["splits"][split]["steps"][str(EVAL_STEPS)]
+        steps = ts["splits"][split]["steps"][str(EVAL_STEPS)]
     except (KeyError, TypeError):
         return {}
     if name == "relaxed":
@@ -718,6 +721,12 @@ def fmt(value, digits=4):
     if value is None or (isinstance(value, float) and not math.isfinite(value)):
         return "-"
     return f"{value:.{digits}g}" if isinstance(value, float) else str(value)
+
+
+def mean_std(values):
+    """Mean and population std of the finite values, as the paper reports its seeds; (None, None) if none."""
+    values = [v for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+    return (statistics.fmean(values), statistics.pstdev(values)) if values else (None, None)
 
 
 def write_report(root, smoke=False):
@@ -735,7 +744,8 @@ def write_report(root, smoke=False):
     out += [f"# {title}", "",
             f"Commit `{manifest.get('commit')}`"
             + (f" (earlier stages ran on {', '.join(f'`{c}`' for c in earlier)})" if earlier else "") + f"; teacher {manifest.get('teacher_steps')} steps, "
-            f"distillation {total} steps per run; recipe-v1 evaluation at {EVAL_STEPS} steps; one seed per run.", ""]
+            f"distillation {total} steps per run; one training seed per run; evaluated as in the paper "
+            f"({PAPER_SAMPLES:,} samples at {EVAL_STEPS} steps, mean ± std over {len(EVAL_SEEDS)} sampling seeds).", ""]
 
     out += ["## Verification", "", "Read back from each run's config.json, metrics.jsonl, final checkpoint "
             "and evaluation provenance.", ""]
@@ -754,23 +764,25 @@ def write_report(root, smoke=False):
                    ("TICA-W2", "resampled", "tica-w2", min),
                    ("E-W2 MALA", "relaxed", "energy-w2", min), ("T-W2 MALA", "relaxed", "torus-w2", min),
                    ("E-W2 proposal", "proposal", "energy-w2", min), ("T-W2 proposal", "proposal", "torus-w2", min)]
-    budget = next((r["ts"] for r in runs.values() if r["ts"]), {})
+    budget = next((ts for r in runs.values() for ts in r["ts"] if ts), {})
     for split in ("test", "val"):
         out += [f"## Sample quality, {split} split", "",
                 f"ESS on the full pool of {budget.get('n_generate_samples')} proposals (clipped = top "
                 f"{100 * budget.get('logw_quantile_filter', 0):g}% of log-weights dropped, the paper's convention); "
                 f"W2 against {budget.get('n_eval_samples')} reference frames for SNIS-resampled samples, after "
-                f"{budget.get('posthoc_mala_steps')} MALA steps, and for raw proposals.", "",
+                f"{budget.get('posthoc_mala_steps')} MALA steps, and for raw proposals. Mean ± std over "
+                f"{len(EVAL_SEEDS)} sampling seeds.", "",
                 "| run | " + " | ".join(c[0] for c in metric_cols) + " |", "|---|" + "---|" * len(metric_cols)]
-        values = {name: [stage(runs[name], split, st).get(key) for _, st, key, _ in metric_cols] for name, _, _ in RUNS}
-        best = []
-        for i, (_, _, _, pick) in enumerate(metric_cols):
-            finite = [v[i] for v in values.values() if isinstance(v[i], (int, float)) and math.isfinite(v[i])]
-            best.append(pick(finite) if finite else None)
+        stats = {name: [mean_std(stage(ts, split, st).get(key) for ts in runs[name]["ts"])
+                        for _, st, key, _ in metric_cols] for name, _, _ in RUNS}
+        best = [pick([s[i][0] for s in stats.values() if s[i][0] is not None] or [None])
+                for i, (_, _, _, pick) in enumerate(metric_cols)]
         for name, _, _ in RUNS:
-            cells = [(f"**{fmt(v)}**" if v is not None and v == best[i] else fmt(v)) for i, v in enumerate(values[name])]
+            cells = ["-" if m is None else ("**{}**" if m == best[i] else "{}").format(f"{fmt(m)} ± {fmt(s, 2)}")
+                     for i, (m, s) in enumerate(stats[name])]
             out.append(f"| {name} | " + " | ".join(cells) + " |")
-            data["runs"].setdefault(name, {})[split] = dict(zip((c[0] for c in metric_cols), values[name]))
+            data["runs"].setdefault(name, {})[split] = {c[0]: {"mean": m, "std": s}
+                                                        for c, (m, s) in zip(metric_cols, stats[name])}
         for method, ref in PAPER.items():
             cells = [f"{ref['ess'][0]} ± {ref['ess'][1]}", "-", f"{ref['energy-w2'][0]} ± {ref['energy-w2'][1]}",
                      f"{ref['torus-w2'][0]} ± {ref['torus-w2'][1]}"] + ["-"] * (len(metric_cols) - 4)
@@ -804,14 +816,14 @@ def write_report(root, smoke=False):
                    f"{fmt(max(ess) if ess else None)} | {resumed or '-'} |")
 
     out += ["", "## Reading these numbers", "",
-            "- One seed per run. The paper's seed std for SCALLOP (ESS ±0.001, E-W2 ±0.116, T-W2 ±0.027) "
-            "is the scale of seed noise; gaps much smaller than that are not evidence.",
+            "- Evaluation follows the paper: 2e5 samples, SNIS with 0.2% log-weight clipping, batch 1e4, "
+            "mean ± std over three sampling seeds. That ± is sampling noise only: each run is one training "
+            "seed, so gaps between runs also carry training-seed noise, which is not measured here.",
             ("- Training follows the paper's stated recipe for {:,} teacher and {:,} distillation steps "
-             "(the paper: 4,000,000 updates). Evaluation draws the paper's 2e5 samples with SNIS and 0.2% "
-             "log-weight clipping, from one seed instead of the paper's three.".format(
-                 manifest.get("teacher_steps", 0), total) if recipe == "paper" else
-             "- The paper's rows are 3 seeds and 4M AdamW updates; this repo's recipe is 100k Muon "
-             "distillation steps and one seed, so absolute values differ."),
+             "(the paper: 4,000,000 updates).".format(manifest.get("teacher_steps", 0), total)
+             if recipe == "paper" else
+             "- The paper trains with 4M AdamW updates; this repo's recipe is 100k Muon distillation "
+             "steps, so absolute values differ."),
             "- The paper does not name its split; transferable-samplers reports on test."]
     text = "\n".join(out) + "\n"
     with open(os.path.join(root, "report.md"), "w") as fh:

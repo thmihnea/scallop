@@ -158,11 +158,20 @@ def write_run(root, name, order, cycle, step):
     return out
 
 
-def test_evaluation_draws_the_papers_sample_count(tmp_path):
+def test_evaluation_follows_the_paper_and_reports_mean_and_std_over_seeds(tmp_path):
     for name, order, cycle in cycle_ablation.RUNS:
         write_run(tmp_path, name, order, cycle, cycle_ablation.DISTILL_STEPS)
-    argv = pipeline(tmp_path).eval_jobs()[0].argv(None)
-    assert argv[argv.index('--n_generate_samples') + 1] == '200000'
+    evals = [job.argv(None) for job in pipeline(tmp_path).eval_jobs() if job.name.startswith('run1_square:eval')]
+    flag = lambda argv, name: argv[argv.index(name) + 1]
+    assert [flag(a, '--seed') for a in evals] == ['0', '1', '2']
+    assert {flag(a, '--n_generate_samples') for a in evals} == {'200000'}
+    assert not any('--batch_size' in a for a in evals)  # eval_peptide_ts's default, the paper's 1e4
+    for seed, ess in zip(cycle_ablation.EVAL_SEEDS, (.01, .02, .03)):
+        out = tmp_path / 'eval' / 'run1_square' / f'seed{seed}'
+        out.mkdir(parents=True)
+        metrics = {'splits': {'test': {'steps': {'4': {'resampled': {'effective-sample-size': ess}}}}}}
+        (out / 'ts_metrics.json').write_text(json.dumps(metrics))
+    assert '| run1_square | **0.02 ± 0.0082** |' in cycle_ablation.write_report(str(tmp_path))
 
 
 def test_verification_flags_wrong_order_missing_cycle_and_short_runs(tmp_path):
