@@ -158,6 +158,13 @@ def write_run(root, name, order, cycle, step):
     return out
 
 
+def test_evaluation_draws_the_papers_sample_count(tmp_path):
+    for name, order, cycle in cycle_ablation.RUNS:
+        write_run(tmp_path, name, order, cycle, cycle_ablation.DISTILL_STEPS)
+    argv = pipeline(tmp_path).eval_jobs()[0].argv(None)
+    assert argv[argv.index('--n_generate_samples') + 1] == '200000'
+
+
 def test_verification_flags_wrong_order_missing_cycle_and_short_runs(tmp_path):
     write_run(tmp_path, 'good', 'square', True, 10)
     write_run(tmp_path, 'bad', 'forward', False, 9)

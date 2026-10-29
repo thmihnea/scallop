@@ -111,6 +111,7 @@ PAPER = {
     "FALCON": {"ess": (.067, .013), "energy-w2": (.225, .104), "torus-w2": (.402, .021)},
     "FALCON-A": {"ess": (.097, .007), "energy-w2": (.512, .038), "torus-w2": (.180, .005)},
 }
+PAPER_SAMPLES = 200_000  # proposals per evaluation, as in the paper (recipe v1 alone draws 1e6)
 SMOKE_EVAL = ["--n_generate_samples", "20000", "--n_eval_samples", "1000", "--posthoc_mala_steps", "128"]
 
 
@@ -563,7 +564,8 @@ class Pipeline:
             device = ["--device", self.opts.device]
             evaluate = [sys.executable, "py/launchers/eval_peptide_ts.py", "--cfg_path", CFG_PATH,
                         "--eval_recipe", "v1", "--ts_data_dir", self.opts.data_dir, "--out_dir", out_dir,
-                        "--ckpt_path", ckpt, "--batch_size", "1000", "--n_workers", workers] + device
+                        "--ckpt_path", ckpt, "--batch_size", "1000", "--n_workers", workers,
+                        "--n_generate_samples", str(PAPER_SAMPLES)] + device
             round_trip = [sys.executable, "py/launchers/eval_round_trip.py", "--cfg_path", CFG_PATH,
                           "--ckpt_path", ckpt, "--out_dir", out_dir, "--ts_data_dir", self.opts.data_dir,
                           "--steps", str(EVAL_STEPS)] + device
@@ -805,11 +807,11 @@ def write_report(root, smoke=False):
             "- One seed per run. The paper's seed std for SCALLOP (ESS ±0.001, E-W2 ±0.116, T-W2 ±0.027) "
             "is the scale of seed noise; gaps much smaller than that are not evidence.",
             ("- Training follows the paper's stated recipe for {:,} teacher and {:,} distillation steps "
-             "(the paper: 4,000,000 updates). Evaluation is recipe v1 (1e6 proposals, 10k resampled "
-             "samples, MALA), not the paper's 2e5 SNIS samples over 3 seeds.".format(
+             "(the paper: 4,000,000 updates). Evaluation draws the paper's 2e5 samples with SNIS and 0.2% "
+             "log-weight clipping, from one seed instead of the paper's three.".format(
                  manifest.get("teacher_steps", 0), total) if recipe == "paper" else
-             "- The paper's rows are 3 seeds, 2e5 samples, 4M AdamW updates; this repo's recipe is 100k "
-             "Muon distillation steps, 1e6 proposals and 10k resampled samples, so absolute values differ."),
+             "- The paper's rows are 3 seeds and 4M AdamW updates; this repo's recipe is 100k Muon "
+             "distillation steps and one seed, so absolute values differ."),
             "- The paper does not name its split; transferable-samplers reports on test."]
     text = "\n".join(out) + "\n"
     with open(os.path.join(root, "report.md"), "w") as fh:
