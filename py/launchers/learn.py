@@ -97,6 +97,12 @@ def parse_command_line_arguments():
     )
     parser.add_argument("--density_ema_fac", type=float, default=None,
                         help="configured EMA decay for density consistency (default: first EMA)")
+    parser.add_argument("--cycle_loss", action="store_true",
+                        help="add the velocity and density round-trip (cycle) losses to LSD")
+    parser.add_argument("--cycle_stopgrad", choices=["none", "directional"], default=None,
+                        help="with --cycle_loss: 'none' keeps every path live (default); 'directional' "
+                             "stops the forward-in-time jump and the landing point so only the "
+                             "backward-in-time jump learns from the cycle")
     parser.add_argument("--offdiag_time_order", choices=["square", "forward"], default=None,
                         help="off-diagonal time pairs: independent square or ordered forward")
     parser.add_argument("--diag_tmax", type=float, default=None,
@@ -121,11 +127,13 @@ def parse_command_line_arguments():
     parser.add_argument("--log_freq", type=int, default=None,
                         help="scalar logging frequency; saves/evaluation keep their own frequencies")
     parser.add_argument("--total_steps", type=int, default=None, help="override stage budget (velocity: 400k; density/flow map: 100k)")
-    parser.add_argument("--training_recipe", choices=["branched_muon"], default=None,
-                        help="dlogpdt LSD/PSD/ESD: 4 shared + 2 blocks/head, Muon/AdamW, "
+    parser.add_argument("--training_recipe", choices=["branched_muon", "paper"], default=None,
+                        help="branched_muon (dlogpdt LSD/PSD/ESD): 4 shared + 2 blocks/head, Muon/AdamW, "
                              "sqrt decay after 50k without warmup, forward times, vectorized/linear density, "
-                             "and CUDA graphs on CUDA; explicit flags override the recipe")
-    parser.add_argument("--optimizer", choices=["radam", "muon_adamw"], default=None,
+                             "and CUDA graphs on CUDA. paper (pretrain_v or dlogpdt): the SCALLOP paper's "
+                             "AdamW, 2.5%% warm-up + sqrt decay, batch 1000, 4e6 steps, learned loss weights, "
+                             "eps 1e-5 and 6 shared + 3 density blocks. Explicit flags override the recipe")
+    parser.add_argument("--optimizer", choices=["radam", "muon_adamw", "adamw"], default=None,
                         help="default Muon uses hidden attention/MLP matrices with auxiliary AdamW; radam opts out")
     parser.add_argument("--decay_steps", type=int, default=None,
                         help="decay scale for --schedule_type sqrt (cosine uses total_steps)")
@@ -265,6 +273,9 @@ def setup_config_dict(args):
     if recipe == "branched_muon":
         from common.training_recipes import apply_branched_muon
         apply_branched_muon(cfg, mode=args.mode, device=args.device)
+    elif recipe == "paper":
+        from common.training_recipes import apply_paper
+        apply_paper(cfg, mode=args.mode)
     sampling_steps = getattr(args, "n_sampling_steps", None)
     if sampling_steps is not None:
         if any(step < 1 for step in sampling_steps):
@@ -423,6 +434,13 @@ def setup_config_dict(args):
             raise ValueError("--use_weight requires --logvar_channels (or config logvar_channels)")
         cfg.logging.wandb_name += f"_logvar{cfg.network.logvar_channels}"
         cfg.logging.output_name = cfg.logging.wandb_name
+    if args.cycle_loss:
+        cfg.training.cycle_loss = True
+        cfg.training.cycle_stopgrad = args.cycle_stopgrad or "none"
+        cfg.logging.wandb_name += "_cycle" + ("_sgdir" if cfg.training.cycle_stopgrad == "directional" else "")
+        cfg.logging.output_name = cfg.logging.wandb_name
+    elif args.cycle_stopgrad is not None:
+        raise ValueError("--cycle_stopgrad requires --cycle_loss")
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
         cfg.logging.output_name = cfg.logging.wandb_name
@@ -554,10 +572,10 @@ def train_loop(cfg, statics, state, device, seed):
           f"(external loaded: {statics.teacher_params is not None})")
 
     total_steps = cfg.optimization.total_steps
-    pbar = tqdm(range(state.step, total_steps), initial=state.step, total=total_steps,
-                disable=not distributed.is_main(), mininterval=10.0)
-    for step in pbar:
-        start = time.time()
+    pbar = tqdm(initial=state.step, total=total_steps, disable=not distributed.is_main(), mininterval=10.0)
+    skipped = 0
+    while state.step < total_steps:
+        start, step = time.time(), state.step
         args = loss_args.get_loss_fn_args(cfg, statics, gen_cpu, device)
 
         self_teacher = state.self_teacher() if "self" in (diag_source, offdiag_source) else None
@@ -573,6 +591,13 @@ def train_loop(cfg, statics, state, device, seed):
             state, statics.loss, teacher_diag, teacher_offdiag, args, gen_dev
         )
         state = ema_update(state)
+        if state.step == step:  # a non-finite update was skipped: retry with a fresh batch unless it persists
+            skipped += 1
+            if skipped == 10:
+                break
+            continue
+        skipped = 0
+        pbar.update()
         elapsed = time.time() - start
 
         completed = step + 1
@@ -589,6 +614,7 @@ def train_loop(cfg, statics, state, device, seed):
                 pbar.set_postfix(loss=float(loss_value), refresh=False)
             # Evaluation and checkpoint IO run on rank zero with the unwrapped net.
             distributed.barrier()
+    pbar.close()
 
     complete = torch.tensor(state.step == total_steps, device=device, dtype=torch.int32)
     if distributed.active():

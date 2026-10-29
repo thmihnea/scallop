@@ -26,6 +26,43 @@ AAAAAA_PRETRAIN_V_DEFAULTS = dict(
 )
 
 
+# The SCALLOP paper's molecular setup (arXiv:2606.29110, appendix): AdamW at 1e-4 with
+# weight decay 1e-4 and gradient clip 10, square-root annealing after a 2.5% warm-up,
+# EMA 0.999, batch 1000, 4e6 updates, learned e^{-w} loss weights (Eq. 24), times in
+# [0, 1 - 1e-5], and a DiT with 6 shared and 3 log-density blocks. The paper leaves the
+# sqrt decay onset and the weight network's width unstated; these keep the repo's 50k
+# steps and EDM2's 128 log-variance channels.
+PAPER_EPS = 1e-5
+PAPER_DEFAULTS = dict(
+    optimizer="adamw", learning_rate=1e-4, weight_decay=1e-4, clip=10.,
+    schedule_type="sqrt", warmup_fraction=.025, decay_steps=50000,
+    b1=.9, b2=.999, eps=1e-8, bs=1000, total_steps=4_000_000,
+)
+PAPER_LAYOUT = dict(num_layers=6, num_shared_layers=6, num_div_layers=3)
+PAPER_LOGVAR_CHANNELS = 128
+
+
+def apply_paper(cfg, *, mode):
+    """The paper's stated setup, for the velocity teacher, a velocity-only flow map and SCALLOP alike.
+
+    Call after selecting the loss family and before explicit CLI overrides, which
+    still apply (e.g. --total_steps, --offdiag_time_order).
+    """
+    if mode not in ("pretrain_v", "pretrain_flowmap", "dlogpdt"):
+        raise ValueError("the paper recipe covers --mode pretrain_v (teacher), pretrain_flowmap and dlogpdt (SCALLOP)")
+    cfg.training.recipe = "paper"
+    cfg.training.tmax = 1. - PAPER_EPS
+    cfg.training.diag_tmax = 1. - PAPER_EPS
+    cfg.training.ema_facs = [.999]
+    cfg.training.density_ema_fac = .999
+    cfg.network.dit_kwargs.update(PAPER_LAYOUT)
+    cfg.network.use_weight = True
+    cfg.network.logvar_channels = PAPER_LOGVAR_CHANNELS
+    cfg.teacher.ema_fac = .999
+    cfg.optimization.update(PAPER_DEFAULTS)
+    return cfg
+
+
 def apply_branched_muon(cfg, *, mode, device):
     """Select branched density training with the current optimizer/schedule defaults.
 

@@ -180,8 +180,8 @@ def _calc_div_loss(net, div_pred, div_target, t, *, factorized=None) -> torch.Te
 
     The diagonal linear objective and conditional ESD density objectives use
     pred^2 - 2*pred*sg(target). This preserves prediction semigradients for fixed
-    weights, but changes loss values AND learned log-variance gradients. Never
-    silently add the constant back when a learned weight is enabled.
+    weights, but the value can be negative, and a learned weight e^{-w} L + w has
+    no minimum for L < 0, so by default learned weights keep the full square (paper Eq. 24).
     """
     wtype = net.config.div_loss_weighting_type
     if wtype == "uniform":
@@ -193,7 +193,7 @@ def _calc_div_loss(net, div_pred, div_target, t, *, factorized=None) -> torch.Te
     else:
         raise ValueError(f"Invalid div_loss_weighting_type: {wtype}")
     if factorized is None:
-        factorized = wtype == "linear"
+        factorized = wtype == "linear" and not getattr(net, "use_weight", False)
     target = div_target.detach()
     error = div_pred.square() - 2.0 * div_pred * target if factorized else (div_pred - target).square()
     return _sum_non_batch(error) * factor / _get_div_loss_scaling(net)
@@ -342,7 +342,7 @@ def _raw_jvp(net, s, t, x, velocity=None):
 
 
 def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
-                      *, conditional_density=False):
+                      *, conditional_density=False, cycle=None):
     v_loss = _sum_non_batch((u - target_u.detach()) ** 2)
     if d is None:
         _require_div_head(net, family)
@@ -354,6 +354,9 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         d_loss = _sum_non_batch((d - target_d.detach()) ** 2) / _get_div_loss_scaling(net)
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
     base = weighted_velocity + d_loss
+    if cycle is not None:
+        cycle_v, cycle_d = cycle
+        base = base + cycle_v + cycle_d
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
@@ -362,6 +365,9 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         value = math.exp(-weight) * base + weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
+    if cycle is not None:
+        metrics[f"{family}/cycle_v_loss"] = cycle_v.detach()
+        metrics[f"{family}/cycle_div_loss"] = cycle_d.detach()
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -372,9 +378,39 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     return value, metrics
 
 
+def _cycle_loss(net, s, t, x, u, d, stopgrad="none"):
+    """Round-trip residuals u(x,s,t) - u(X,t,s) and d(x,s,t) - d(X,t,s).
+
+    ``none`` keeps every path live. ``directional`` follows the self-distillation
+    rule: of the two jumps, the one running forward in time (the sampler, anchored
+    to the diagonal by LSD) is the stopped target and only the backward-in-time
+    jump learns; the landing point X is detached, as in LSD.
+    """
+    if stopgrad not in ("none", "directional"):
+        raise ValueError(f"Unknown cycle_stopgrad: {stopgrad!r} (expected 'none' or 'directional')")
+    directional = stopgrad == "directional"
+    land = x + _bcast(t - s, u) * (u.detach() if directional else u)
+    back_u, back_d = _split_div(net.calc_phi(
+        t, s, land.detach() if directional else land, train=False, return_div=True,
+    ))
+    if directional:
+        def target_forward(first, second):
+            # Per sample: stop whichever jump goes forward in time (first iff t > s).
+            forward = _bcast(t - s, first) > 0
+            return torch.where(forward, first.detach(), first), torch.where(forward, second, second.detach())
+        u, back_u = target_forward(u, back_u)
+        if d is not None:
+            d, back_d = target_forward(d, back_d)
+    v_loss = _sum_non_batch((u - back_u) ** 2)
+    if d is None:
+        return v_loss, torch.zeros_like(v_loss)
+    return v_loss, _sum_non_batch((d - back_d) ** 2) / _get_div_loss_scaling(net)
+
+
 def lsd_term(
     net, teacher_params, x0, x1, label, s, t, *, interp,
     stopgrad_type="stopped", density_ema_params=None, eps=None, generator=None,
+    cycle_loss=False, cycle_stopgrad="none",
 ):
     """u + delta*partial_t u = sg(v_t(X_theta)); likewise for raw d.
 
@@ -382,12 +418,15 @@ def lsd_term(
     Velocity uses the explicitly selected teacher. Density uses its own EMA
     diagonal source at the detached CURRENT student endpoint. Divergence
     estimators and source conditional labels are never used at that endpoint.
+    ``cycle_loss`` adds the round-trip losses of :func:`_cycle_loss` (stopped as
+    ``cycle_stopgrad`` says) inside LSD's weight.
     """
     _validate_stopgrad(stopgrad_type)
     x = interp.calc_It(s, x0, x1)
     primal, tangent = _raw_jvp(net, s, t, x)
     u, d = _split_div(primal)
     dt_u, dt_d = _split_div(tangent)
+    cycle = _cycle_loss(net, s, t, x, u, d, cycle_stopgrad) if cycle_loss else None
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
@@ -406,7 +445,7 @@ def lsd_term(
             target_d = g
         else:
             target_d = g - _bcast(t - s, d) * dt_d.detach()
-    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d)
+    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
 def psd_term(
@@ -571,6 +610,10 @@ def setup_loss(cfg, net, interp):
         if getattr(cfg.training, "diag_teacher_source", "conditional") != "conditional":
             raise ValueError("esd_imf requires conditional diagonal supervision")
     psd_type = getattr(cfg.training, "psd_type", None)
+    cycle_loss = getattr(cfg.training, "cycle_loss", False)
+    cycle_stopgrad = getattr(cfg.training, "cycle_stopgrad", "none")
+    if cycle_loss and loss_type != "lsd":
+        raise ValueError("cycle_loss requires loss_type='lsd'")
     if getattr(net.config, "predict_divergence", False):
         if not math.isfinite(net.config.divergence_rescale) or net.config.divergence_rescale <= 0:
             raise ValueError("Density training requires a finite positive divergence_rescale")
@@ -599,7 +642,8 @@ def setup_loss(cfg, net, interp):
             return lsd_term(
                 net, teacher, x0, x1, label, s, t,
                 interp=interp, stopgrad_type=stopgrad_type,
-                density_ema_params=density_ema,
+                density_ema_params=density_ema, cycle_loss=cycle_loss,
+                cycle_stopgrad=cycle_stopgrad,
             )
         elif loss_type in ESD_LOSS_TYPES:
             return esd_term(

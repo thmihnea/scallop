@@ -93,6 +93,28 @@ python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
     --ckpt_path '<hutchinson-checkpoint.pt>' --batch_size 1000
 ```
 
+### Cycle-loss ablation
+
+`scripts/cycle_ablation.sh` runs the invertibility ablation on ace_a_nme from a bare GPU
+machine: it clones this branch, builds the environment, checks CUDA graphs, trains one velocity
+teacher and four SCALLOP runs (square or forward time pairs, each with and without
+`--cycle_loss`), then evaluates them with recipe v1 and a round-trip check and writes
+`report.md`. It runs in the background, resumes after interruptions and prints progress.
+
+`RECIPE=paper` (the default) trains the teacher and every run with the paper's stated setup
+(`--training_recipe paper`: AdamW, 2.5% warm-up then sqrt decay, batch 1000, learned
+e^{-w} loss weights, times in [0, 1 - 1e-5], 6 shared + 3 density blocks, 4e6 updates per
+stage); its cycle runs stop gradients directionally (`--cycle_stopgrad directional`) inside
+LSD's learned weight. `RECIPE=repo` reproduces the first ablation with the README recipe.
+`TEACHER_STEPS` and `DISTILL_STEPS` set the budgets; `FLOWMAP_STEPS` first distills a
+velocity-only flow map per run from the teacher, and SCALLOP then starts from it.
+
+```bash
+bash scripts/cycle_ablation.sh          # start, then follow the log
+bash scripts/cycle_ablation.sh status   # progress table
+bash scripts/cycle_ablation.sh report   # comparison report
+```
+
 ### Image experiments
 
 Code and experiments for images are in [scallop-image](https://github.com/tonyauyeung/scallop-image.git).
