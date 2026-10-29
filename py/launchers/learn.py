@@ -573,6 +573,7 @@ def train_loop(cfg, statics, state, device, seed):
 
     total_steps = cfg.optimization.total_steps
     pbar = tqdm(initial=state.step, total=total_steps, disable=not distributed.is_main(), mininterval=10.0)
+    skipped = 0
     while state.step < total_steps:
         start, step = time.time(), state.step
         args = loss_args.get_loss_fn_args(cfg, statics, gen_cpu, device)
@@ -590,8 +591,12 @@ def train_loop(cfg, statics, state, device, seed):
             state, statics.loss, teacher_diag, teacher_offdiag, args, gen_dev
         )
         state = ema_update(state)
-        if state.step == step:
-            continue  # a non-finite update was skipped; retry with a fresh batch
+        if state.step == step:  # a non-finite update was skipped: retry with a fresh batch unless it persists
+            skipped += 1
+            if skipped == 10:
+                break
+            continue
+        skipped = 0
         pbar.update()
         elapsed = time.time() - start
 

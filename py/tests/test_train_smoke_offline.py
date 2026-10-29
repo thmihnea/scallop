@@ -154,7 +154,8 @@ def test_offline_training_step(loss_type, stopgrad, mode, psd_type, vectorized):
 
 @pytest.mark.parametrize('start,target,outcomes', [
     (0, 3, [True, True, True]), (1, 3, [True, True]), (3, 3, []),
-    (0, 3, [True, False, True, True]), (1, 3, [False, True, False, True]), (4, 3, []),
+    (0, 3, [True, False, True, True]), (1, 3, [False, True, False, True]),
+    (1, 3, [True] + [False] * 10), (1, 3, [False] * 10), (4, 3, []),
 ])
 @pytest.mark.parametrize('sources', [('external', 'external'), ('conditional', 'self'), ('ema', 'ema')])
 @pytest.mark.parametrize('log_freq', [1, 2])
@@ -188,8 +189,8 @@ def test_outer_loop_requires_completed_budget(monkeypatch, start, target, outcom
         with pytest.raises(RuntimeError, match=rf'{actual}.*{target}'):
             learn.train_loop(cfg, statics, state, 'cpu', 0)
         assert saved == []
-    if outcomes:
-        assert logs[-1] == (target, actual)
+    if any(outcomes):
+        assert logs[-1] == (actual, actual)
 
     assert state.self_teacher.call_count == (len(outcomes) if 'self' in sources else 0)
     assert state.ema_teacher.call_count == (len(outcomes) if 'ema' in sources else 0)
