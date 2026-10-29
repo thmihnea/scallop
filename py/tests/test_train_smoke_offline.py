@@ -154,8 +154,7 @@ def test_offline_training_step(loss_type, stopgrad, mode, psd_type, vectorized):
 
 @pytest.mark.parametrize('start,target,outcomes', [
     (0, 3, [True, True, True]), (1, 3, [True, True]), (3, 3, []),
-    (0, 3, [True, False, True]), (1, 3, [False, True]),
-    (0, 3, [False, False, False]), (4, 3, []),
+    (0, 3, [True, False, True, True]), (1, 3, [False, True, False, True]), (4, 3, []),
 ])
 @pytest.mark.parametrize('sources', [('external', 'external'), ('conditional', 'self'), ('ema', 'ema')])
 @pytest.mark.parametrize('log_freq', [1, 2])

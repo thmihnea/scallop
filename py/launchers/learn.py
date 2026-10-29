@@ -581,10 +581,9 @@ def train_loop(cfg, statics, state, device, seed):
           f"(external loaded: {statics.teacher_params is not None})")
 
     total_steps = cfg.optimization.total_steps
-    pbar = tqdm(range(state.step, total_steps), initial=state.step, total=total_steps,
-                disable=not distributed.is_main(), mininterval=10.0)
-    for step in pbar:
-        start = time.time()
+    pbar = tqdm(initial=state.step, total=total_steps, disable=not distributed.is_main(), mininterval=10.0)
+    while state.step < total_steps:
+        start, step = time.time(), state.step
         args = loss_args.get_loss_fn_args(cfg, statics, gen_cpu, device)
 
         self_teacher = state.self_teacher() if "self" in (diag_source, offdiag_source) else None
@@ -600,6 +599,9 @@ def train_loop(cfg, statics, state, device, seed):
             state, statics.loss, teacher_diag, teacher_offdiag, args, gen_dev
         )
         state = ema_update(state)
+        if state.step == step:
+            continue  # a non-finite update was skipped; retry with a fresh batch
+        pbar.update()
         elapsed = time.time() - start
 
         completed = step + 1
@@ -616,6 +618,7 @@ def train_loop(cfg, statics, state, device, seed):
                 pbar.set_postfix(loss=float(loss_value), refresh=False)
             # Evaluation and checkpoint IO run on rank zero with the unwrapped net.
             distributed.barrier()
+    pbar.close()
 
     complete = torch.tensor(state.step == total_steps, device=device, dtype=torch.int32)
     if distributed.active():
