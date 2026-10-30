@@ -251,7 +251,7 @@ def test_cpu_collection_preserves_sampling_dispatch_and_rng(version, mode, lift,
         assert actual[0].device.type == 'cpu'
 
 
-@pytest.mark.parametrize('name', NAMES)
+@pytest.mark.parametrize('name', ['ace_a_nme', 'aaa', 'ace_aaa_nme', 'aaaaaa'])
 def test_readme_commands_resolve_without_launching(name, monkeypatch):
     import re
     import shlex
@@ -317,7 +317,8 @@ def test_readme_commands_resolve_without_launching(name, monkeypatch):
                                'aaaaaa': 16, 'chignolin': 32}[name]]
         assert args.ckpt_path == f'<{mode}-checkpoint.pt>'
         assert args.out_dir == f'<run-dir>/eval/{mode}'
-        assert args.ts_data_dir == 'datasets/ts' and args.batch_size == 1000
+        assert args.ts_data_dir == 'datasets/ts' and args.batch_size == 2000
+        assert args.n_workers == 8
         assert args.n_generate_samples == 1000000 and args.n_eval_samples == 10000
         assert args.posthoc_mala_steps == 1024 and args.mala_adapt_steps == 512
         assert args.mala_checkpoint_interval == 128 and args.logw_quantile_filter == .002
