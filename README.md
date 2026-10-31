@@ -35,8 +35,9 @@ conda activate flowmaps
 ### Pretrain the velocity teacher
 
 ```bash
-# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa | chignolin
+# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa
 python py/launchers/learn.py --cfg_path 'configs.<system>' \
+    --mode pretrain_v --from_scratch \
     --ts_data_dir datasets/ts --output_folder '<run-dir>/pretrain_v'
 ```
 
@@ -54,7 +55,7 @@ and runs 1,024 MALA updates, reporting validation and test metrics separately.
 Training 👇
 
 ```bash
-# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa | chignolin
+# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa
 python py/launchers/learn.py --cfg_path 'configs.<system>' \
     --mode dlogpdt \
     --ts_data_dir datasets/ts --output_folder '<run-dir>/dlogpdt' \
@@ -64,11 +65,11 @@ python py/launchers/learn.py --cfg_path 'configs.<system>' \
 Evaluation 👇
 
 ```bash
-# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa | chignolin
+# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa
 python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
-    --eval_recipe v1 \
+    --mode dlogpdt --eval_recipe v1 \
     --ts_data_dir datasets/ts --out_dir '<run-dir>/eval/dlogpdt' \
-    --ckpt_path '<dlogpdt-checkpoint.pt>' --batch_size 1000
+    --ckpt_path '<dlogpdt-checkpoint.pt>' --batch_size 2000 --n_workers 8
 ```
 
 #### F2D2
@@ -76,7 +77,7 @@ python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
 Training 👇
 
 ```bash
-# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa | chignolin
+# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa
 python py/launchers/learn.py --cfg_path 'configs.<system>' \
     --mode hutchinson \
     --ts_data_dir datasets/ts --output_folder '<run-dir>/hutchinson' \
@@ -86,11 +87,11 @@ python py/launchers/learn.py --cfg_path 'configs.<system>' \
 Evaluation 👇
 
 ```bash
-# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa | chignolin
+# <system>: ace_a_nme | aaa | ace_aaa_nme | aaaaaa
 python py/launchers/eval_peptide_ts.py --cfg_path 'configs.<system>' \
     --mode hutchinson --eval_recipe v1 \
     --ts_data_dir datasets/ts --out_dir '<run-dir>/eval/hutchinson' \
-    --ckpt_path '<hutchinson-checkpoint.pt>' --batch_size 1000
+    --ckpt_path '<hutchinson-checkpoint.pt>' --batch_size 2000 --n_workers 8
 ```
 
 ### Image experiments
