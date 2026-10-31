@@ -99,6 +99,8 @@ def parse_command_line_arguments():
                         help="configured EMA decay for density consistency (default: first EMA)")
     parser.add_argument("--offdiag_time_order", choices=["square", "forward"], default=None,
                         help="off-diagonal time pairs: independent square or ordered forward")
+    parser.add_argument("--enforce_cycle_loss", "--enforce-cycle-loss", action="store_true",
+                        help="dlogpdt+lsd: add round-trip cycle losses for the velocity and density heads")
     parser.add_argument("--diag_tmax", type=float, default=None,
                         help="upper time bound for diagonal anchors; dlogpdt needs <1 (default .999)")
     parser.add_argument(
@@ -422,6 +424,12 @@ def setup_config_dict(args):
         if getattr(cfg.network, "logvar_channels", None) is None:
             raise ValueError("--use_weight requires --logvar_channels (or config logvar_channels)")
         cfg.logging.wandb_name += f"_logvar{cfg.network.logvar_channels}"
+        cfg.logging.output_name = cfg.logging.wandb_name
+    if args.enforce_cycle_loss:
+        if args.mode != "dlogpdt" or cfg.training.loss_type != "lsd":
+            raise ValueError("--enforce_cycle_loss requires --mode dlogpdt with loss_type lsd")
+        cfg.training.enforce_cycle_loss = True
+        cfg.logging.wandb_name += "_cycle"
         cfg.logging.output_name = cfg.logging.wandb_name
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
