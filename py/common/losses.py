@@ -342,7 +342,7 @@ def _raw_jvp(net, s, t, x, velocity=None):
 
 
 def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
-                      *, conditional_density=False):
+                      *, conditional_density=False, cycle=()):
     v_loss = _sum_non_batch((u - target_u.detach()) ** 2)
     if d is None:
         _require_div_head(net, family)
@@ -353,7 +353,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     else:
         d_loss = _sum_non_batch((d - target_d.detach()) ** 2) / _get_div_loss_scaling(net)
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
-    base = weighted_velocity + d_loss
+    base = weighted_velocity + d_loss + sum(cycle)
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
@@ -362,6 +362,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         value = math.exp(-weight) * base + weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
+    metrics.update({f"{family}/{family}_cycle_{k}_loss": c.detach() for k, c in zip(("v", "div"), cycle)})
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -375,6 +376,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
 def lsd_term(
     net, teacher_params, x0, x1, label, s, t, *, interp,
     stopgrad_type="stopped", density_ema_params=None, eps=None, generator=None,
+    enforce_cycle=False,
 ):
     """u + delta*partial_t u = sg(v_t(X_theta)); likewise for raw d.
 
@@ -391,6 +393,13 @@ def lsd_term(
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
+    cycle = ()
+    if enforce_cycle:
+        # Round trip: the backward jump t -> s from the stopped endpoint is trained to
+        # reproduce the stopped forward u and d, under the same learned weight as LSD.
+        u_back, d_back = net.calc_phi(t, s, endpoint, train=False, return_div=True)
+        cycle = (_sum_non_batch((u_back - u.detach()) ** 2),
+                 _sum_non_batch((d_back - d.detach()) ** 2) / _get_div_loss_scaling(net))
     # Put live corrections on the prediction side: _consistency_loss always
     # detaches its targets. Teacher calls and the endpoint remain frozen.
     if stopgrad_type == "convex":
@@ -406,7 +415,7 @@ def lsd_term(
             target_d = g
         else:
             target_d = g - _bcast(t - s, d) * dt_d.detach()
-    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d)
+    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
 def psd_term(
@@ -600,6 +609,7 @@ def setup_loss(cfg, net, interp):
                 net, teacher, x0, x1, label, s, t,
                 interp=interp, stopgrad_type=stopgrad_type,
                 density_ema_params=density_ema,
+                enforce_cycle=getattr(cfg.training, "enforce_cycle_loss", False),
             )
         elif loss_type in ESD_LOSS_TYPES:
             return esd_term(
