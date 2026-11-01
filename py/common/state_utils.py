@@ -108,6 +108,9 @@ def load_evaluation_model(cfg, path, device, *, use_ema=True, require_saved_ema=
     layout = _checkpoint_architecture(saved)
     if layout is not None:
         cfg.network.dit_kwargs.update(layout)
+    if "logvar_linear.weight" in saved["params"]:
+        cfg.network.use_weight = True
+        cfg.network.logvar_channels = saved["params"]["logvar_linear.weight"].shape[1]
     net = flow_map_mod.TorchFlowMap(cfg.network).to(device)
     _validate_checkpoint_architecture(net, saved)
     net.load_state_dict(saved["params"], strict=True)
