@@ -23,6 +23,7 @@ import torch
 from torch.func import functional_call
 
 from .se3_utils import remove_mean
+from .com_lift import importance_source_energy
 from .flow_map import _bcast
 from .loss_args import _get_diag_offdiag_bs
 
@@ -418,6 +419,20 @@ def lsd_term(
     return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
+def log_dispersion(net, x, energy, n_steps, power):
+    """Log-dispersion of nu = -E/kT - log q over data x; log q, up to a constant, from backward jumps to noise."""
+    grid = [k / n_steps for k in range(n_steps, -1, -1)]
+    z, logq = x, 0.0
+    for a, b in zip(grid[:-1], grid[1:]):
+        u, d = net.calc_phi(x.new_full((len(x),), a), x.new_full((len(x),), b), z,
+                            train=False, return_div=True)
+        logq = logq + (b - a) * net.config.divergence_rescale * _sum_non_batch(d)
+        z = z + (b - a) * u
+    logq = logq - 0.5 * _sum_non_batch(z.square()) / float(net.config.rescale) ** 2
+    nu = importance_source_energy(x, logq, com_augmentation=getattr(net.config, "com_aware", False)) - energy
+    return (nu - nu.mean()).abs().pow(power).mean()
+
+
 def psd_term(
     net, teacher_params, x0, x1, label, s, t, u, h, *, interp,
     psd_type, stopgrad_type="stopped", density_ema_params=None,
@@ -619,6 +634,8 @@ def setup_loss(cfg, net, interp):
             )
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
+    kappa = getattr(cfg.training, "log_dispersion", 0.0)
+
     def loss(
         teacher_params_diag,
         teacher_params_offdiag,
@@ -629,6 +646,7 @@ def setup_loss(cfg, net, interp):
         t,
         u,
         h,
+        energy=None,
         generator=None,
         diag_eps=None,
         density_ema_params=None,
@@ -671,6 +689,11 @@ def setup_loss(cfg, net, interp):
         # metrics dict unless loss_type == "lsd", which left psd/esd runs with no way
         # to tell a diverging velocity term from a diverging divergence term.
         total_metrics = {k: (_stop(v) / total_bs) for k, v in total_metrics.items()}
+        if kappa:
+            dispersion = log_dispersion(net, x1, energy, cfg.training.log_dispersion_steps,
+                                        cfg.training.log_dispersion_power)
+            total_loss = total_loss + kappa * dispersion
+            total_metrics["finetune/log_dispersion"] = dispersion.detach()
         return total_loss, total_metrics
 
     return loss

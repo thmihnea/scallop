@@ -109,10 +109,11 @@ def sample_times(cfg, generator):
 
 
 def get_loss_fn_args(cfg, statics, generator, device):
-    """Return (x0, x1, label, s, t, u, h) for one training step."""
+    """Return (x0, x1, label, s, t, u, h, energy) for one training step."""
     sbatch, tbatch, ubatch, hbatch = sample_times(cfg, generator)
     x0 = statics.sample_rho0(getattr(cfg.optimization, "local_bs", cfg.optimization.bs), generator, device)
     x1 = next(statics.ds)
+    x1, energy = x1 if isinstance(x1, tuple) else (x1, None)
 
     label = None  # molecule training is unconditional
 
@@ -127,4 +128,5 @@ def get_loss_fn_args(cfg, statics, generator, device):
         _to(tbatch),
         _to(ubatch),
         _to(hbatch),
+        energy,
     )

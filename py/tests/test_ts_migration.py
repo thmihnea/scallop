@@ -226,8 +226,8 @@ def test_training_materializes_only_required_splits(monkeypatch, tmp_path, main,
     monkeypatch.setattr(ts_systems, 'ensure_data', lambda *a, **kw: checks.append(True) or paths)
     monkeypatch.setattr(ts_data.np, 'load', lambda path: reads.append(Path(path).name) or {'train': train, 'val': val}[Path(path).name])
     original = ts_data.build_train_loader
-    monkeypatch.setattr(ts_data, 'build_train_loader', lambda x, std, bs, com, workers, seed:
-                        original(x, std, bs, com, num_workers=0, seed=seed))
+    monkeypatch.setattr(ts_data, 'build_train_loader', lambda x, std, bs, com, workers, seed, energy:
+                        original(x, std, bs, com, num_workers=0, seed=seed, energy=energy))
     monkeypatch.setattr(distributed, 'is_main', lambda: main)
     evaluated = []
     monkeypatch.setattr(ts_eval, 'build_eval_context', lambda cfg, data, **kw: evaluated.append(data) or object())
