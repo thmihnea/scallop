@@ -25,12 +25,24 @@ from .tsx import (
 )
 
 
+class EnergyDataset(TensorDataset):
+    """TensorDataset whose samples also carry the energy of their frame (rigid-motion invariant)."""
+
+    def __init__(self, data, energy, transform):
+        super().__init__(data, transform=transform)
+        self.energy = energy
+
+    def __getitem__(self, idx):
+        return {**super().__getitem__(idx), "energy": self.energy[idx]}
+
+
 def build_train_loader(train: torch.Tensor, std: float, bs: int, com_augmentation: bool = False,
-                       num_workers: int = 2, seed: int = 0):
+                       num_workers: int = 2, seed: int = 0, energy: torch.Tensor | None = None):
     transforms = [StandardizeTransform(std), Random3DRotationTransform()]
     if com_augmentation:
         transforms.append(CenterOfMassTransform())
-    ds = TensorDataset(train, transform=Compose(transforms))
+    transform = Compose(transforms)
+    ds = TensorDataset(train, transform=transform) if energy is None else EnergyDataset(train, energy, transform)
     sampler = None
     if distributed.active():
         sampler = torch.utils.data.DistributedSampler(
@@ -71,12 +83,18 @@ class InfiniteTSLoader:
             self._it = iter(self.loader)
             batch = next(self._it)
         x = batch["x"] if isinstance(batch, dict) else batch
+        if isinstance(batch, dict) and "energy" in batch:
+            return x.to(self.device), batch["energy"].to(self.device)
         return x.to(self.device)
 
 
 def load_peptide(target_or_cfg, bs: int, device, com_augmentation: bool = False,
-                 num_workers: int = 2, seed: int = 0, data_dir: str | None = None):
-    """Return the training iterator and measured std, validating all split paths."""
+                 num_workers: int = 2, seed: int = 0, data_dir: str | None = None,
+                 with_energy: bool = False):
+    """Return the training iterator and measured std, validating all split paths.
+
+    ``with_energy`` makes the iterator yield ``(x, E/kT)``, with OpenMM energies computed once.
+    """
     system = ts_systems.resolve(target_or_cfg)
     if data_dir is None and not isinstance(target_or_cfg, str):
         problem = getattr(target_or_cfg, "problem", target_or_cfg)
@@ -85,7 +103,8 @@ def load_peptide(target_or_cfg, bs: int, device, com_augmentation: bool = False,
 
     train = torch.from_numpy(np.load(paths["train"])).float()
     std = ts_systems.compute_std(train)
-    loader = build_train_loader(train, std, bs, com_augmentation, num_workers, seed)
+    energy = ts_systems.build_potential(system, data_dir)(train) if with_energy else None
+    loader = build_train_loader(train, std, bs, com_augmentation, num_workers, seed, energy)
     infinite = InfiniteTSLoader(loader, device)
 
     print(

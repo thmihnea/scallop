@@ -28,7 +28,6 @@ def setup_train_step(cfg) -> Callable:
     ):
         net = state.net
         optimizer = state.optimizer
-        x0, x1, label, s, t, u, h = loss_args
 
         optimizer.zero_grad(set_to_none=True)
         density_kwargs = {}
@@ -39,7 +38,7 @@ def setup_train_step(cfg) -> Callable:
             )
         if graph_loss is None:
             loss_value, metrics = loss_fn(
-                teacher_diag, teacher_offdiag, x0, x1, label, s, t, u, h,
+                teacher_diag, teacher_offdiag, *loss_args,
                 generator=generator, **density_kwargs
             )
             loss_value.backward()
