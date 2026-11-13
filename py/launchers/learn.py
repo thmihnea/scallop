@@ -99,6 +99,15 @@ def parse_command_line_arguments():
                         help="configured EMA decay for density consistency (default: first EMA)")
     parser.add_argument("--offdiag_time_order", choices=["square", "forward"], default=None,
                         help="off-diagonal time pairs: independent square or ordered forward")
+    parser.add_argument("--enforce_cycle_loss", "--enforce-cycle-loss", action="store_true",
+                        help="dlogpdt+lsd: add round-trip cycle losses for the velocity and density heads")
+    parser.add_argument("--log_dispersion", type=float, default=0.0,
+                        help="fine-tuning: weight kappa of the log-dispersion penalty on the training data "
+                             "(requires --enforce_cycle_loss)")
+    parser.add_argument("--log_dispersion_power", type=float, default=2.0,
+                        help="log-dispersion exponent a >= 1 (2: log-variance)")
+    parser.add_argument("--log_dispersion_steps", type=int, default=4,
+                        help="backward jumps from data to noise used for log q")
     parser.add_argument("--diag_tmax", type=float, default=None,
                         help="upper time bound for diagonal anchors; dlogpdt needs <1 (default .999)")
     parser.add_argument(
@@ -423,6 +432,22 @@ def setup_config_dict(args):
             raise ValueError("--use_weight requires --logvar_channels (or config logvar_channels)")
         cfg.logging.wandb_name += f"_logvar{cfg.network.logvar_channels}"
         cfg.logging.output_name = cfg.logging.wandb_name
+    if args.enforce_cycle_loss:
+        if args.mode != "dlogpdt" or cfg.training.loss_type != "lsd":
+            raise ValueError("--enforce_cycle_loss requires --mode dlogpdt with loss_type lsd")
+        cfg.training.enforce_cycle_loss = True
+        cfg.logging.wandb_name += "_cycle"
+        cfg.logging.output_name = cfg.logging.wandb_name
+    if args.log_dispersion:
+        if (args.log_dispersion < 0 or args.log_dispersion_power < 1 or args.log_dispersion_steps < 1
+                or not args.enforce_cycle_loss):
+            raise ValueError("--log_dispersion needs kappa > 0, --log_dispersion_power >= 1, "
+                             "--log_dispersion_steps >= 1 and --enforce_cycle_loss")
+        cfg.training.log_dispersion = args.log_dispersion
+        cfg.training.log_dispersion_power = args.log_dispersion_power
+        cfg.training.log_dispersion_steps = args.log_dispersion_steps
+        cfg.logging.wandb_name += f"_logdisp{args.log_dispersion:g}"
+        cfg.logging.output_name = cfg.logging.wandb_name
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
         cfg.logging.output_name = cfg.logging.wandb_name
@@ -473,7 +498,7 @@ def setup_state(cfg, device, seed):
     ts_com = getattr(cfg.problem, "com_augmentation", False)
     ds, ts_std = ts_data.load_peptide(
         cfg, getattr(cfg.optimization, "local_bs", cfg.optimization.bs), device,
-        com_augmentation=ts_com, seed=seed
+        com_augmentation=ts_com, seed=seed, with_energy=bool(getattr(cfg.training, "log_dispersion", 0))
     )
     cfg, ex_input = datasets.setup_target(cfg, train_std=ts_std)
     print(f"[ts] transferable-samplers dataloader "

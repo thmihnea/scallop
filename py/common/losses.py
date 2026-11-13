@@ -23,6 +23,7 @@ import torch
 from torch.func import functional_call
 
 from .se3_utils import remove_mean
+from .com_lift import importance_source_energy
 from .flow_map import _bcast
 from .loss_args import _get_diag_offdiag_bs
 
@@ -342,7 +343,7 @@ def _raw_jvp(net, s, t, x, velocity=None):
 
 
 def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
-                      *, conditional_density=False):
+                      *, conditional_density=False, cycle=()):
     v_loss = _sum_non_batch((u - target_u.detach()) ** 2)
     if d is None:
         _require_div_head(net, family)
@@ -353,7 +354,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
     else:
         d_loss = _sum_non_batch((d - target_d.detach()) ** 2) / _get_div_loss_scaling(net)
     weighted_velocity, adaptive_weight = _velocity_objective(net, v_loss)
-    base = weighted_velocity + d_loss
+    base = weighted_velocity + d_loss + sum(cycle)
     weight = net.calc_weight(s, t)
     if torch.is_tensor(weight):
         weight = weight.reshape(-1)
@@ -362,6 +363,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
         value = math.exp(-weight) * base + weight
     metrics = {f"{family}/{family}_v_loss": v_loss.detach(),
                f"{family}/{family}_div_loss": d_loss.detach()}
+    metrics.update({f"{family}/{family}_cycle_{k}_loss": c.detach() for k, c in zip(("v", "div"), cycle)})
     if adaptive_weight is not None:
         metrics[f"{family}/adaptive_weight"] = adaptive_weight
         metrics[f"{family}/weighted_velocity_loss"] = weighted_velocity.detach()
@@ -375,6 +377,7 @@ def _consistency_loss(net, family, s, t, u, target_u, d=None, target_d=None,
 def lsd_term(
     net, teacher_params, x0, x1, label, s, t, *, interp,
     stopgrad_type="stopped", density_ema_params=None, eps=None, generator=None,
+    enforce_cycle=False,
 ):
     """u + delta*partial_t u = sg(v_t(X_theta)); likewise for raw d.
 
@@ -391,6 +394,13 @@ def lsd_term(
     with torch.no_grad():
         endpoint = x + _bcast(t - s, u) * u.detach()
         b = _apply(net, teacher_params, "calc_b", t, endpoint.detach(), train=False)
+    cycle = ()
+    if enforce_cycle:
+        # Round trip: the backward jump t -> s from the stopped endpoint is trained to
+        # reproduce the stopped forward u and d, under the same learned weight as LSD.
+        u_back, d_back = net.calc_phi(t, s, endpoint, train=False, return_div=True)
+        cycle = (_sum_non_batch((u_back - u.detach()) ** 2),
+                 _sum_non_batch((d_back - d.detach()) ** 2) / _get_div_loss_scaling(net))
     # Put live corrections on the prediction side: _consistency_loss always
     # detaches its targets. Teacher calls and the endpoint remain frozen.
     if stopgrad_type == "convex":
@@ -406,7 +416,21 @@ def lsd_term(
             target_d = g
         else:
             target_d = g - _bcast(t - s, d) * dt_d.detach()
-    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d)
+    return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
+
+
+def log_dispersion(net, x, energy, n_steps, power):
+    """Log-dispersion of nu = -E/kT - log q over data x; log q, up to a constant, from backward jumps to noise."""
+    grid = [k / n_steps for k in range(n_steps, -1, -1)]
+    z, logq = x, 0.0
+    for a, b in zip(grid[:-1], grid[1:]):
+        u, d = net.calc_phi(x.new_full((len(x),), a), x.new_full((len(x),), b), z,
+                            train=False, return_div=True)
+        logq = logq + (b - a) * net.config.divergence_rescale * _sum_non_batch(d)
+        z = z + (b - a) * u
+    logq = logq - 0.5 * _sum_non_batch(z.square()) / float(net.config.rescale) ** 2
+    nu = importance_source_energy(x, logq, com_augmentation=getattr(net.config, "com_aware", False)) - energy
+    return (nu - nu.mean()).abs().pow(power).mean()
 
 
 def psd_term(
@@ -600,6 +624,7 @@ def setup_loss(cfg, net, interp):
                 net, teacher, x0, x1, label, s, t,
                 interp=interp, stopgrad_type=stopgrad_type,
                 density_ema_params=density_ema,
+                enforce_cycle=getattr(cfg.training, "enforce_cycle_loss", False),
             )
         elif loss_type in ESD_LOSS_TYPES:
             return esd_term(
@@ -608,6 +633,8 @@ def setup_loss(cfg, net, interp):
                 density_ema_params=density_ema, loss_type=loss_type,
             )
         raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    kappa = getattr(cfg.training, "log_dispersion", 0.0)
 
     def loss(
         teacher_params_diag,
@@ -619,6 +646,7 @@ def setup_loss(cfg, net, interp):
         t,
         u,
         h,
+        energy=None,
         generator=None,
         diag_eps=None,
         density_ema_params=None,
@@ -661,6 +689,11 @@ def setup_loss(cfg, net, interp):
         # metrics dict unless loss_type == "lsd", which left psd/esd runs with no way
         # to tell a diverging velocity term from a diverging divergence term.
         total_metrics = {k: (_stop(v) / total_bs) for k, v in total_metrics.items()}
+        if kappa:
+            dispersion = log_dispersion(net, x1, energy, cfg.training.log_dispersion_steps,
+                                        cfg.training.log_dispersion_power)
+            total_loss = total_loss + kappa * dispersion
+            total_metrics["finetune/log_dispersion"] = dispersion.detach()
         return total_loss, total_metrics
 
     return loss
