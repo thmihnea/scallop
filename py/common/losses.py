@@ -634,7 +634,7 @@ def setup_loss(cfg, net, interp):
             )
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    kappa = getattr(cfg.training, "log_dispersion", 0.0)
+    use_dispersion = getattr(cfg.training, "log_dispersion", False)
 
     def loss(
         teacher_params_diag,
@@ -689,10 +689,14 @@ def setup_loss(cfg, net, interp):
         # metrics dict unless loss_type == "lsd", which left psd/esd runs with no way
         # to tell a diverging velocity term from a diverging divergence term.
         total_metrics = {k: (_stop(v) / total_bs) for k, v in total_metrics.items()}
-        if kappa:
+        if use_dispersion:
             dispersion = log_dispersion(net, x1, energy, cfg.training.log_dispersion_steps,
                                         cfg.training.log_dispersion_power)
-            total_loss = total_loss + kappa * dispersion
+            # Equivalent to adding the penalty inside every sample's exp(-w(s, t)) * [...] bracket
+            # (diagonal samples have s = t); without learned weights the multiplier is 1.
+            weight = net.calc_weight(s, t)
+            total_loss = total_loss + (torch.exp(-weight).mean() if torch.is_tensor(weight)
+                                       else math.exp(-weight)) * dispersion
             total_metrics["finetune/log_dispersion"] = dispersion.detach()
         return total_loss, total_metrics
 
