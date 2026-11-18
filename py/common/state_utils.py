@@ -87,6 +87,16 @@ def _validate_checkpoint_architecture(net, sd):
         )
 
 
+def _inference_tensors(net, tensors):
+    """Drop learned loss-weight heads that an inference model does not build.
+
+    They only weight training losses; sampling and log q never read them.
+    """
+    if getattr(net, "use_weight", False):
+        return tensors
+    return {k: v for k, v in tensors.items() if not k.startswith("logvar_")}
+
+
 def load_evaluation_model(cfg, path, device, *, use_ema=True, require_saved_ema=False,
                           ema_factor=None, velocity_only=False):
     """Read one native checkpoint and build an inference model without an optimizer.
@@ -110,7 +120,7 @@ def load_evaluation_model(cfg, path, device, *, use_ema=True, require_saved_ema=
         cfg.network.dit_kwargs.update(layout)
     net = flow_map_mod.TorchFlowMap(cfg.network).to(device)
     _validate_checkpoint_architecture(net, saved)
-    net.load_state_dict(saved["params"], strict=True)
+    net.load_state_dict(_inference_tensors(net, saved["params"]), strict=True)
     selected_factor = None
     if use_ema:
         selected_factor = ema_factor if ema_factor is not None else getattr(cfg.logging, "visual_ema_factor", None)
@@ -118,6 +128,8 @@ def load_evaluation_model(cfg, path, device, *, use_ema=True, require_saved_ema=
             selected_factor = cfg.training.ema_facs[0]
         ema = next((value for key, value in saved.get("ema_params", {}).items()
                     if float(key) == selected_factor), None)
+        if ema is not None:
+            ema = _inference_tensors(net, ema)
         tensors = _model_tensors(net)
         if require_saved_ema:
             if ema is None:
@@ -163,8 +175,14 @@ def setup_schedule(cfg) -> Callable[[int], float]:
     elif opt.schedule_type == "sqrt":
         if opt.decay_steps <= 0:
             raise ValueError("decay_steps must be positive")
+        warmup_fraction = float(getattr(opt, "warmup_fraction", 0.0))
+        if not math.isfinite(warmup_fraction) or not 0 <= warmup_fraction < 1:
+            raise ValueError("warmup_fraction must be finite and in [0, 1)")
+        # EDM2-style linear ramp, then square-root annealing (the paper's schedule).
+        warmup = int(opt.total_steps * warmup_fraction) if warmup_fraction else 0
         def sched(step):
-            return lr / math.sqrt(max(step / opt.decay_steps, 1.0))
+            ramp = min(step / warmup, 1.0) if warmup else 1.0
+            return lr * ramp / math.sqrt(max(step / opt.decay_steps, 1.0))
     elif opt.schedule_type == "constant":
         def sched(step):
             return lr
@@ -192,6 +210,16 @@ def setup_optimizer(cfg, net: torch.nn.Module):
             adamw_lr_multiplier=getattr(opt, "adamw_lr_multiplier", 1.),
             weight_decay=weight_decay,
         ), schedule
+    if kind == "adamw":
+        tx = torch.optim.AdamW(
+            net.parameters(),
+            lr=cfg.optimization.learning_rate,
+            betas=(getattr(cfg.optimization, "b1", 0.9), getattr(cfg.optimization, "b2", 0.999)),
+            eps=getattr(cfg.optimization, "eps", 1e-8),
+            weight_decay=weight_decay,
+        )
+        tx.optimizer_type = "adamw"
+        return tx, schedule
     if kind != "radam":
         raise ValueError(f"Unknown optimizer: {kind}")
     tx = torch.optim.RAdam(
@@ -269,7 +297,7 @@ class TrainState:
         if load_optimizer and "opt_state" in sd:
             current_kind = getattr(self.optimizer, "optimizer_type", "radam")
             saved_kind = sd.get("optimizer_type", sd["opt_state"].get("optimizer_type", "radam"))
-            if "muon_adamw" in (current_kind, saved_kind) and current_kind != saved_kind:
+            if current_kind != saved_kind:
                 raise ValueError("Changing optimizer type requires reset_optimizer=True")
         # Captures must not retain the EMA allocations replaced by this restore.
         self._cuda_graph_generation += 1

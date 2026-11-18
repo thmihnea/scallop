@@ -66,7 +66,7 @@ def diagonal_term(p,teacher,z,data,label,t,rng,*,interp,X):
     if d is not None:
         target_d=sg(target_d/X.config.divergence_rescale)
         factor={'uniform':1.,'linear':1-t,'square':(1-t)**2}[X.config.div_loss_weighting_type]
-        error = d**2-2*d*target_d if X.config.div_loss_weighting_type == 'linear' else (d-target_d)**2
+        error = d**2-2*d*target_d if X.config.div_loss_weighting_type == 'linear' and not X.config.use_weight else (d-target_d)**2
         value=value+jnp.sum(error)*factor/scale(X)
     return weighted(X,p,t,t,value),{}
 

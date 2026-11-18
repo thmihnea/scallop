@@ -114,7 +114,7 @@ def test_diagonal_density_factorization_weighting_and_scale(weight,vectorized,le
     pred=torch.full_like(x,.7) if vectorized else t+.7
     target=torch.full_like(pred,-.2)
     factor={'uniform':torch.ones_like(t),'linear':1-t,'square':(1-t)**2}[weight]
-    raw = pred.square()-2*pred*target if weight == 'linear' else (pred-target).square()
+    raw = pred.square()-2*pred*target if weight == 'linear' and not learned_weight else (pred-target).square()
     expected=raw.reshape(3,-1).sum(1)*factor/(6 if vectorized else 1)
     torch.testing.assert_close(losses._calc_div_loss(net,pred,target,t),expected)
     # Production diagonal loss uses the stopped, scaled estimator and ordinary student heads.
@@ -125,7 +125,7 @@ def test_diagonal_density_factorization_weighting_and_scale(weight,vectorized,le
     lv,metrics=losses.diagonal_term(net,None,z,data,None,t,
         interp=interpolant.setup_interpolant(build_problem_config()))
     u,d=net.calc_b(t,xt,return_div=True)
-    raw_d = d.square()-2*d*q if weight == 'linear' else (d-q).square()
+    raw_d = d.square()-2*d*q if weight == 'linear' and not learned_weight else (d-q).square()
     div_expected = raw_d.reshape(3,-1).sum(1)*factor/(6 if vectorized else 1)
     expected=(u-(data-z)).square().sum((1,2))+div_expected
     if learned_weight:
