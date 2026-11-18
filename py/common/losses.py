@@ -419,17 +419,23 @@ def lsd_term(
     return _consistency_loss(net, "lsd", s, t, u, target_u, d, target_d, cycle=cycle)
 
 
-def log_dispersion(net, x, energy, n_steps, power):
-    """Log-dispersion of nu = -E/kT - log q over data x; log q, up to a constant, from backward jumps to noise."""
+def log_importance(net, params, x, energy, n_steps):
+    """nu = -E/kT - log q over data x under ``params`` (None: the student); log q, up to a constant,
+    from backward jumps to noise."""
     grid = [k / n_steps for k in range(n_steps, -1, -1)]
     z, logq = x, 0.0
     for a, b in zip(grid[:-1], grid[1:]):
-        u, d = net.calc_phi(x.new_full((len(x),), a), x.new_full((len(x),), b), z,
-                            train=False, return_div=True)
+        u, d = _apply(net, params, "calc_phi", x.new_full((len(x),), a), x.new_full((len(x),), b), z,
+                      train=False, return_div=True)
         logq = logq + (b - a) * net.config.divergence_rescale * _sum_non_batch(d)
         z = z + (b - a) * u
     logq = logq - 0.5 * _sum_non_batch(z.square()) / float(net.config.rescale) ** 2
-    nu = importance_source_energy(x, logq, com_augmentation=getattr(net.config, "com_aware", False)) - energy
+    return importance_source_energy(x, logq, com_augmentation=getattr(net.config, "com_aware", False)) - energy
+
+
+def log_dispersion(net, x, energy, n_steps, power):
+    """Log-dispersion of the student's nu over data x."""
+    nu = log_importance(net, None, x, energy, n_steps)
     return (nu - nu.mean()).abs().pow(power).mean()
 
 
@@ -573,8 +579,12 @@ def esd_imf_term(
 # --------------------------------------------------------------------------- #
 
 
-def setup_loss(cfg, net, interp):
-    """Assemble diagonal anchors and the selected consistency update."""
+def setup_loss(cfg, net, interp, frozen_params=None):
+    """Assemble diagonal anchors and the selected consistency update.
+
+    ``frozen_params`` is the fixed model whose log q gives the importance weights when
+    ``cfg.training.importance_weights == "frozen"``.
+    """
     _velocity_objective(net, torch.zeros(1))  # validate opt-in metric settings
     loss_type = cfg.training.loss_type
     stopgrad_type = cfg.training.stopgrad_type
@@ -635,6 +645,9 @@ def setup_loss(cfg, net, interp):
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
     use_dispersion = getattr(cfg.training, "log_dispersion", False)
+    importance = getattr(cfg.training, "importance_weights", None)
+    if importance == "frozen" and frozen_params is None:
+        raise ValueError("importance_weights='frozen' needs the frozen model's params")
 
     def loss(
         teacher_params_diag,
@@ -670,6 +683,15 @@ def setup_loss(cfg, net, interp):
                 net, None if loss_type == "esd_imf" else teacher_params_diag, x0[:diag_bs], x1[:diag_bs], label_diag,
                 t[:diag_bs], interp=interp, eps=diag_eps, generator=generator,
             )
+            if importance:
+                # Self-normalised weights exp(nu) reweight the data towards exp(-E): the diagonal terms
+                # then target the Boltzmann distribution. The largest 0.2% of nu are clipped.
+                with torch.no_grad():
+                    nu = log_importance(net, frozen_params if importance == "frozen" else density_ema_params,
+                                        x1[:diag_bs], energy[:diag_bs], cfg.training.log_dispersion_steps)
+                    nu = torch.minimum(nu, nu.topk(math.ceil(0.002 * diag_bs)).values[-1])
+                    importance_w = diag_bs * torch.softmax(nu, 0)
+                diag_loss_vec = importance_w * diag_loss_vec
             total_loss = total_loss + diag_loss_vec.sum()
             _accumulate(total_metrics, diag_metrics)
 
@@ -689,6 +711,8 @@ def setup_loss(cfg, net, interp):
         # metrics dict unless loss_type == "lsd", which left psd/esd runs with no way
         # to tell a diverging velocity term from a diverging divergence term.
         total_metrics = {k: (_stop(v) / total_bs) for k, v in total_metrics.items()}
+        if importance:
+            total_metrics["finetune/importance_ess"] = 1 / importance_w.square().mean()
         if use_dispersion:
             dispersion = log_dispersion(net, x1, energy, cfg.training.log_dispersion_steps,
                                         cfg.training.log_dispersion_power)
