@@ -108,6 +108,11 @@ def parse_command_line_arguments():
                         help="log-dispersion exponent a >= 1 (2: log-variance)")
     parser.add_argument("--log_dispersion_steps", type=int, default=4,
                         help="backward jumps from data to noise used for log q")
+    parser.add_argument("--importance_weights", choices=["frozen", "ema"], default=None,
+                        help="fine-tuning: weight each diagonal sample by exp(-E/kT - log q), normalised over the "
+                             "batch, so the diagonal terms target exp(-E); q is the --teacher_load_path model "
+                             "(frozen) or the run's EMA (ema). Needs --diag_teacher_source conditional, a "
+                             "non-external --offdiag_teacher_source and --enforce_cycle_loss")
     parser.add_argument("--diag_tmax", type=float, default=None,
                         help="upper time bound for diagonal anchors; dlogpdt needs <1 (default .999)")
     parser.add_argument(
@@ -447,6 +452,19 @@ def setup_config_dict(args):
         cfg.training.log_dispersion_steps = args.log_dispersion_steps
         cfg.logging.wandb_name += f"_logdisp_a{args.log_dispersion_power:g}"
         cfg.logging.output_name = cfg.logging.wandb_name
+    if args.importance_weights:
+        # A teacher velocity target would ignore the weights; the frozen q is the --teacher_load_path model.
+        if (not args.enforce_cycle_loss or args.log_dispersion_steps < 1
+                or getattr(cfg.training, "diag_teacher_source", None) != "conditional"
+                or getattr(cfg.training, "offdiag_teacher_source", None) not in ("self", "ema")
+                or (args.importance_weights == "frozen") != bool(cfg.teacher.load_path)):
+            raise ValueError("--importance_weights needs --enforce_cycle_loss, --log_dispersion_steps >= 1, "
+                             "--diag_teacher_source conditional, --offdiag_teacher_source self or ema, and "
+                             "--teacher_load_path exactly when it is 'frozen'")
+        cfg.training.importance_weights = args.importance_weights
+        cfg.training.log_dispersion_steps = args.log_dispersion_steps
+        cfg.logging.wandb_name += f"_iw-{args.importance_weights}"
+        cfg.logging.output_name = cfg.logging.wandb_name
     if args.wandb_name_suffix:
         cfg.logging.wandb_name += args.wandb_name_suffix
         cfg.logging.output_name = cfg.logging.wandb_name
@@ -497,7 +515,8 @@ def setup_state(cfg, device, seed):
     ts_com = getattr(cfg.problem, "com_augmentation", False)
     ds, ts_std = ts_data.load_peptide(
         cfg, getattr(cfg.optimization, "local_bs", cfg.optimization.bs), device,
-        com_augmentation=ts_com, seed=seed, with_energy=bool(getattr(cfg.training, "log_dispersion", 0))
+        com_augmentation=ts_com, seed=seed,
+        with_energy=bool(getattr(cfg.training, "log_dispersion", 0) or getattr(cfg.training, "importance_weights", None))
     )
     cfg, ex_input = datasets.setup_target(cfg, train_std=ts_std)
     print(f"[ts] transferable-samplers dataloader "
@@ -505,7 +524,7 @@ def setup_state(cfg, device, seed):
 
     state, net, schedule = state_utils.setup_training_state(cfg, device)
     teacher_params = state_utils.load_teacher_params(cfg, state, device)
-    loss = losses.setup_loss(cfg, net, interp)
+    loss = losses.setup_loss(cfg, net, interp, frozen_params=teacher_params)
 
     # Every mode uses held-out TS evaluation; pretraining has proposal metrics only.
     if distributed.is_main() and getattr(cfg.logging, "visual_freq", 0):
