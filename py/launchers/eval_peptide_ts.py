@@ -109,6 +109,8 @@ def parse_args(argv=None):
                         "run in identical arithmetic. Pass bf16_trunk to reproduce training.")
     p.add_argument("--no_ema", action="store_true", help="use raw params instead of EMA")
     p.add_argument("--no_plots", action="store_true")
+    p.add_argument("--roundtrip", type=int, default=0,
+                   help="only test invertibility: jump this many proposals 0 -> 1 -> 0, write roundtrip.json, exit")
     args = p.parse_args(argv)
     if args.eval_recipe == "v1":
         recipe_steps = {"configs.ace_a_nme": 4, "configs.aaa": 4,
@@ -297,6 +299,22 @@ def main():
         x0 = rescale * torch.randn((args.n_generate_samples, n_part, n_dim), generator=gen, device=device)
         if not getattr(cfg.network, "com_aware", False):
             x0 = remove_mean(x0)
+
+        if args.roundtrip:  # forward jumps 0 -> 1, then the same nodes backwards 1 -> 0
+            rt, z = {}, x0[:args.roundtrip]
+            for n in args.steps:
+                x1, fwd = net._integrate(0.0, 1.0, z, n_steps=n, time_discretization_type=args.time_discretization_type)
+                zb, bwd = net._integrate(1.0, 0.0, x1, n_steps=n, time_discretization_type=args.time_discretization_type)
+                errs = {"dlogp_fwd": fwd, "dlogp_cycle": fwd + bwd,
+                        "logq_gap": net.base_log_prob(z) - net.base_log_prob(zb) + fwd + bwd,
+                        "x_cycle_rms": (zb - z).pow(2).flatten(1).mean(1).sqrt()}
+                rt[n] = {k: {"mean": v.mean().item(), "mean_abs": v.abs().mean().item(),
+                             "median_abs": v.abs().median().item(), "max_abs": v.abs().max().item()}
+                         for k, v in errs.items()}
+                print(f"[roundtrip] n_steps={n}: {json.dumps(rt[n])}", flush=True)
+            with open(os.path.join(args.out_dir, "roundtrip.json"), "w") as fh:
+                json.dump(rt, fh, indent=2)
+            return
 
         torch.manual_seed(args.seed)
         generated, stage_diagnostics = {}, {}
