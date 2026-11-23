@@ -55,3 +55,6 @@ cache/
 # Keep README assets, including files covered by the generated-output rules above.
 !/assets/
 !/assets/**
+
+# Conda install recorded by setup.sh for scripts/tmux_sessions.sh.
+/.conda_base
